@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+
+# Output files
+outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
