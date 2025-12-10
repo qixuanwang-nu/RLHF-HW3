@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, get_linear_schedule_with_warmup
 
 
 @dataclass
@@ -47,7 +47,10 @@ class DPOConfig:
     
     # Reference model
     ref_model_update_freq: int = 0  # 0 = never update reference, >0 = update every N steps
-    
+
+    # Learning rate schedule
+    warmup_ratio: float = 0.1  # Fraction of training for warmup
+
     # Other
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -357,7 +360,10 @@ class DPOTrainer:
             lr=config.learning_rate,
             weight_decay=config.weight_decay
         )
-        
+
+        # Scheduler will be initialized in train() when we know total steps
+        self.scheduler = None
+
         # Training metrics
         self.training_stats = []
         self.global_step = 0
@@ -473,8 +479,13 @@ class DPOTrainer:
             self.config.max_grad_norm
         )
         metrics["grad_norm"] = grad_norm.item()
-        
+
         self.optimizer.step()
+
+        # Step scheduler if initialized
+        if self.scheduler is not None:
+            self.scheduler.step()
+            metrics["learning_rate"] = self.scheduler.get_last_lr()[0]
         
         # Track timing and memory
         step_time = time.time() - start_time
@@ -499,16 +510,26 @@ class DPOTrainer:
     ) -> List[Dict[str, float]]:
         """
         Full DPO training loop.
-        
+
         Args:
             dataloader: DataLoader with preference pairs
             num_epochs: Number of training epochs
             log_every: Logging frequency
-            
+
         Returns:
             training_stats: List of training metrics
         """
         total_steps = len(dataloader) * num_epochs
+
+        # Initialize learning rate scheduler with warmup
+        warmup_steps = int(total_steps * self.config.warmup_ratio)
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
+        )
+        print(f"LR scheduler: {warmup_steps} warmup steps, {total_steps} total steps")
+
         pbar = tqdm(total=total_steps, desc="DPO Training")
         
         for epoch in range(num_epochs):
@@ -623,17 +644,15 @@ class DPOTrainer:
 
 def prepare_dpo_data(
     dataset,
-    tokenizer: PreTrainedTokenizer,
     max_samples: int = None
 ) -> List[Dict]:
     """
     Prepare DPO training data from HH-RLHF dataset.
-    
+
     Args:
         dataset: HuggingFace dataset with 'chosen' and 'rejected'
-        tokenizer: Tokenizer
         max_samples: Maximum samples to use
-        
+
     Returns:
         List of dicts with 'prompt', 'chosen', 'rejected'
     """

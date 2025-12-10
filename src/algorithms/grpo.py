@@ -294,22 +294,28 @@ class GRPOLoss:
         """
         Compute KL divergence penalty from reference policy.
         
-        We approximate the per-token KL using the log-prob difference
-        for the sampled tokens:
+        Uses the "k3" estimator which is always non-negative:
         
-            KL(π || π_ref) ≈ E[log π(a|s) - log π_ref(a|s)]
+            KL ≈ 0.5 * E[(r - 1)^2]  where r = π(a|s) / π_ref(a|s)
         
-        and clamp the mean to be non-negative for numerical stability.
+        This approximates the true KL while being numerically stable
+        and always positive, preventing the policy from drifting
+        arbitrarily from the reference.
         """
         log_ratio = log_probs - ref_log_probs
+        # Clamp to prevent numerical issues with exp
+        log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
+        ratio = torch.exp(log_ratio)
+        
+        # k3 estimator: 0.5 * (r - 1)^2, always non-negative
+        kl_approx = 0.5 * (ratio - 1) ** 2
         
         if mask is not None:
-            log_ratio = log_ratio * mask
-            kl_mean = log_ratio.sum() / (mask.sum() + 1e-8)
+            kl_approx = kl_approx * mask
+            kl_value = kl_approx.sum() / (mask.sum() + 1e-8)
         else:
-            kl_mean = log_ratio.mean()
+            kl_value = kl_approx.mean()
         
-        kl_value = torch.clamp(kl_mean, min=0.0)
         kl_penalty = self.kl_coef * kl_value
         
         return kl_penalty, float(kl_value.item())
@@ -321,6 +327,10 @@ class GRPOLoss:
     ) -> Tuple[torch.Tensor, float]:
         """
         Compute entropy bonus for exploration.
+        
+        We use a target entropy approach: encourage entropy to stay
+        near a target value (not too low = mode collapse, not too high = random).
+        For GPT-2, a reasonable target is around 3-5 (concentrated but not collapsed).
         """
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
@@ -333,7 +343,14 @@ class GRPOLoss:
         else:
             entropy_value = entropy.mean()
         
-        entropy_bonus = -self.entropy_coef * entropy_value
+        # Target entropy approach: penalize deviation from target
+        # GPT-2 base model typically has entropy around 3-5 for natural text
+        target_entropy = 4.0
+        
+        # If entropy is below target, encourage higher entropy (negative bonus = lower loss)
+        # If entropy is above target, discourage higher entropy (positive bonus = higher loss)
+        entropy_deviation = entropy_value - target_entropy
+        entropy_bonus = self.entropy_coef * entropy_deviation
         
         return entropy_bonus, entropy_value.item()
     

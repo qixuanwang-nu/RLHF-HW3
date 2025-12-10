@@ -367,8 +367,7 @@ def train_dpo(
     
     # Prepare DPO data
     dpo_data = prepare_dpo_data(
-        raw_dataset, 
-        tokenizer,
+        raw_dataset,
         max_samples=args.num_prompts
     )
     print(f"Prepared {len(dpo_data)} preference pairs")
