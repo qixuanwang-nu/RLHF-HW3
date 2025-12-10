@@ -555,6 +555,22 @@ class DPOTrainer:
             "avg_memory_gb": np.mean(self.memory_usage) if self.memory_usage else 0,
         }
     
+    def save_model(self, output_dir: str):
+        """
+        Save the trained policy model.
+        
+        Args:
+            output_dir: Directory to save the model
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save the policy model
+        self.policy.model.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        
+        print(f"DPO policy model saved to {output_dir}")
+    
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
         """
@@ -673,6 +689,7 @@ def create_dpo_trainer(
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # Required for decoder-only models
     
     # Create policy model
     print(f"Loading DPO policy model from {config.model_name}...")

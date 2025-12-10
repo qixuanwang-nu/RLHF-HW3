@@ -31,8 +31,8 @@ class PPOConfig:
     
     # PPO hyperparameters
     clip_ratio: float = 0.2  # ε in clipped surrogate
-    kl_coef: float = 0.1  # β for KL penalty
-    entropy_coef: float = 0.01  # Entropy bonus coefficient
+    kl_coef: float = 0.2  # β for KL penalty (increased for stability)
+    entropy_coef: float = 0.05  # Entropy bonus coefficient (increased to prevent collapse)
     value_coef: float = 0.5  # Value loss coefficient
     
     # Training settings
@@ -48,7 +48,7 @@ class PPOConfig:
     top_p: float = 0.9
     
     # KL control
-    target_kl: float = 0.01  # Target KL divergence
+    target_kl: float = 0.5  # Target KL divergence (increased for language models)
     kl_horizon: int = 10000  # Steps for adaptive KL
     adaptive_kl: bool = True  # Whether to use adaptive KL coefficient
     
@@ -212,12 +212,18 @@ class PPOLoss:
             policy_loss: Scalar loss
             metrics: Dictionary of metrics
         """
-        # Compute probability ratio
-        ratio = torch.exp(log_probs - old_log_probs)
+        # Compute probability ratio with numerical stability
+        log_ratio = log_probs - old_log_probs
+        # Clamp log ratio to prevent exp explosion
+        log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
+        ratio = torch.exp(log_ratio)
         
         # Expand advantages if needed
         if advantages.dim() == 1 and log_probs.dim() == 2:
             advantages = advantages.unsqueeze(1).expand_as(log_probs)
+        
+        # Clip advantages for stability
+        advantages = torch.clamp(advantages, -10.0, 10.0)
         
         # Clipped surrogate objective
         surr1 = ratio * advantages
@@ -236,12 +242,13 @@ class PPOLoss:
         # Compute metrics
         with torch.no_grad():
             clip_fraction = ((ratio - 1.0).abs() > self.clip_ratio).float().mean().item()
-            approx_kl = (old_log_probs - log_probs).mean().item()
+            # Approximate KL using (r-1) - log(r) formula (always positive)
+            approx_kl = ((ratio - 1) - torch.log(ratio + 1e-8)).mean().item()
         
         metrics = {
             "policy_loss": policy_loss.item(),
             "clip_fraction": clip_fraction,
-            "approx_kl": approx_kl,
+            "approx_kl": max(0, approx_kl),  # Ensure non-negative
             "ratio_mean": ratio.mean().item(),
         }
         
@@ -256,7 +263,13 @@ class PPOLoss:
         """
         Compute KL divergence penalty from reference policy.
         
-        KL(π || π_ref) ≈ E[log π - log π_ref]
+        We approximate the per-token KL using the log-prob difference
+        for the sampled tokens:
+        
+            KL(π || π_ref) ≈ E[log π(a|s) - log π_ref(a|s)]
+        
+        and then clamp the mean to be non-negative for numerical
+        stability (true KL is ≥ 0).
         
         Args:
             log_probs: Current policy log probs
@@ -267,17 +280,21 @@ class PPOLoss:
             kl_penalty: Weighted KL penalty
             kl_value: Raw KL divergence value
         """
-        kl = log_probs - ref_log_probs
+        # Approximate KL using per-token log-prob differences
+        log_ratio = log_probs - ref_log_probs
         
         if mask is not None:
-            kl = kl * mask
-            kl_value = kl.sum() / mask.sum()
+            log_ratio = log_ratio * mask
+            # Average only over valid (masked) positions
+            kl_mean = log_ratio.sum() / (mask.sum() + 1e-8)
         else:
-            kl_value = kl.mean()
+            kl_mean = log_ratio.mean()
         
+        # Ensure non-negative KL for stability / logging
+        kl_value = torch.clamp(kl_mean, min=0.0)
         kl_penalty = self.kl_coef * kl_value
         
-        return kl_penalty, kl_value.item()
+        return kl_penalty, float(kl_value.item())
     
     def compute_entropy_bonus(
         self,
@@ -720,8 +737,9 @@ class PPOTrainer:
             
             all_metrics.append(metrics)
             
-            # Early stopping if KL too high
-            if metrics["approx_kl"] > 1.5 * self.config.target_kl:
+            # Early stopping if KL too high (use actual KL, not approx)
+            # Use a more reasonable threshold for language models
+            if metrics["kl_divergence"] > 10.0:  # Stop if KL > 10
                 break
         
         # Aggregate metrics
@@ -730,13 +748,20 @@ class PPOTrainer:
             avg_metrics[key] = np.mean([m[key] for m in all_metrics])
         avg_metrics["ppo_epochs_actual"] = len(all_metrics)
         
-        # Adaptive KL coefficient
+        # Adaptive KL coefficient - more aggressive adjustment
         if self.config.adaptive_kl:
-            if avg_metrics["kl_divergence"] > 2.0 * self.config.target_kl:
+            kl = avg_metrics["kl_divergence"]
+            target = max(0.1, self.config.target_kl)  # Minimum target of 0.1
+            
+            if kl > 4.0 * target:  # KL way too high
+                self.ppo_loss.kl_coef *= 2.0
+            elif kl > 2.0 * target:  # KL too high
                 self.ppo_loss.kl_coef *= 1.5
-            elif avg_metrics["kl_divergence"] < 0.5 * self.config.target_kl:
-                self.ppo_loss.kl_coef *= 0.5
-            self.ppo_loss.kl_coef = max(0.001, min(1.0, self.ppo_loss.kl_coef))
+            elif kl < 0.5 * target:  # KL too low
+                self.ppo_loss.kl_coef *= 0.8
+            
+            # Keep coefficient in reasonable range
+            self.ppo_loss.kl_coef = max(0.01, min(2.0, self.ppo_loss.kl_coef))
             avg_metrics["kl_coef"] = self.ppo_loss.kl_coef
         
         return avg_metrics
@@ -759,8 +784,20 @@ class PPOTrainer:
         # 1. Generate responses
         responses, full_ids, attention_mask = self.generate_responses(prompts)
         
-        # 2. Compute rewards
-        rewards = self.compute_rewards(full_ids, attention_mask)
+        # 2. Compute rewards and normalize
+        raw_rewards = self.compute_rewards(full_ids, attention_mask)
+        
+        # Normalize rewards for stability (running mean/std) on raw rewards
+        if not hasattr(self, 'reward_mean'):
+            self.reward_mean = raw_rewards.mean().item()
+            self.reward_std = raw_rewards.std().item() + 1e-8
+        else:
+            # Exponential moving average
+            alpha = 0.1
+            self.reward_mean = (1 - alpha) * self.reward_mean + alpha * raw_rewards.mean().item()
+            self.reward_std = (1 - alpha) * self.reward_std + alpha * (raw_rewards.std().item() + 1e-8)
+        
+        rewards = (raw_rewards - self.reward_mean) / self.reward_std
         
         # 3. Compute log probs and values from current and reference policy
         self.policy.eval()
@@ -796,9 +833,11 @@ class PPOTrainer:
             advantages, returns, response_mask
         )
         
-        # Add reward statistics
-        metrics["reward_mean"] = rewards.mean().item()
-        metrics["reward_std"] = rewards.std().item()
+        # Add reward statistics (both raw and normalized for debugging)
+        metrics["reward_mean"] = raw_rewards.mean().item()
+        metrics["reward_std"] = raw_rewards.std().item()
+        metrics["reward_mean_norm"] = rewards.mean().item()
+        metrics["reward_std_norm"] = rewards.std().item()
         metrics["response_length_mean"] = response_mask.sum(dim=1).float().mean().item()
         metrics["step_time"] = time.time() - start_time
         
@@ -868,6 +907,22 @@ class PPOTrainer:
         
         pbar.close()
         return self.training_stats
+    
+    def save_model(self, output_dir: str):
+        """
+        Save the trained policy model.
+        
+        Args:
+            output_dir: Directory to save the model
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save the policy model
+        self.policy.model.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        
+        print(f"PPO policy model saved to {output_dir}")
 
 
 def create_ppo_trainer(
@@ -893,6 +948,7 @@ def create_ppo_trainer(
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # Required for decoder-only models during generation
     
     # Create policy model
     print(f"Loading policy model from {config.model_name}...")

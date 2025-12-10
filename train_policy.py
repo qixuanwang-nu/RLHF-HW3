@@ -71,10 +71,10 @@ def parse_args():
                         help="PPO clip ratio")
     parser.add_argument("--ppo_epochs", type=int, default=4,
                         help="PPO epochs per batch")
-    parser.add_argument("--kl_coef", type=float, default=0.1,
-                        help="KL penalty coefficient")
-    parser.add_argument("--entropy_coef", type=float, default=0.01,
-                        help="Entropy bonus coefficient")
+    parser.add_argument("--kl_coef", type=float, default=0.5,
+                        help="KL penalty coefficient (higher = more stable)")
+    parser.add_argument("--entropy_coef", type=float, default=0.1,
+                        help="Entropy bonus coefficient (higher = prevents mode collapse)")
     
     # GRPO specific
     parser.add_argument("--group_size", type=int, default=4,
@@ -229,6 +229,10 @@ def train_ppo(
     with open(os.path.join(ppo_dir, "training_stats.json"), "w") as f:
         json.dump(stats, f, indent=2)
     
+    # Save the trained model
+    model_dir = os.path.join(ppo_dir, "model")
+    trainer.save_model(model_dir)
+    
     print(f"\nPPO training complete. Results saved to {ppo_dir}")
     
     return stats
@@ -306,6 +310,10 @@ def train_grpo(
     efficiency_stats = trainer.get_efficiency_stats()
     with open(os.path.join(grpo_dir, "efficiency_stats.json"), "w") as f:
         json.dump(efficiency_stats, f, indent=2)
+    
+    # Save the trained model
+    model_dir = os.path.join(grpo_dir, "model")
+    trainer.save_model(model_dir)
     
     print(f"\nGRPO training complete. Results saved to {grpo_dir}")
     
@@ -397,6 +405,10 @@ def train_dpo(
     efficiency_stats = trainer.get_efficiency_stats()
     with open(os.path.join(dpo_dir, "efficiency_stats.json"), "w") as f:
         json.dump(efficiency_stats, f, indent=2)
+    
+    # Save the trained model
+    model_dir = os.path.join(dpo_dir, "model")
+    trainer.save_model(model_dir)
     
     print(f"\nDPO training complete. Results saved to {dpo_dir}")
     

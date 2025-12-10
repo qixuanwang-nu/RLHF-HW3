@@ -25,8 +25,8 @@ class GRPOConfig:
     
     # GRPO hyperparameters
     group_size: int = 4  # Number of responses per prompt (4-8 recommended)
-    kl_coef: float = 0.05  # KL penalty coefficient
-    entropy_coef: float = 0.01  # Entropy bonus coefficient
+    kl_coef: float = 0.1  # KL penalty coefficient (increased for stability)
+    entropy_coef: float = 0.05  # Entropy bonus coefficient (increased to prevent collapse)
     
     # Advantage normalization
     normalize_advantages: bool = True
@@ -187,7 +187,7 @@ class GRPOLoss:
         self,
         rewards: torch.Tensor,
         group_size: int
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute advantages relative to group mean.
         
@@ -200,22 +200,27 @@ class GRPOLoss:
             
         Returns:
             advantages: Advantage estimates [batch_size * group_size]
+            stats: Statistics about the advantages
         """
         batch_size = rewards.size(0) // group_size
         
         # Reshape to [batch_size, group_size]
         rewards_grouped = rewards.view(batch_size, group_size)
         
-        # Compute group mean and std
+        # Compute group mean (baseline)
         group_mean = rewards_grouped.mean(dim=1, keepdim=True)
-        group_std = rewards_grouped.std(dim=1, keepdim=True) + 1e-8
         
         # Compute advantages relative to group mean
         advantages_grouped = rewards_grouped - group_mean
         
-        # Optionally normalize by group std
+        # Track within-group statistics before normalization
+        within_group_std = rewards_grouped.std(dim=1).mean().item()
+        
+        # Normalize by GLOBAL std across all advantages (not per-group)
+        # This preserves relative magnitude differences between groups
         if self.normalize_advantages:
-            advantages_grouped = advantages_grouped / group_std
+            global_std = advantages_grouped.std() + 1e-8
+            advantages_grouped = advantages_grouped / global_std
         
         # Clip extreme advantages
         advantages_grouped = torch.clamp(
@@ -227,7 +232,15 @@ class GRPOLoss:
         # Flatten back
         advantages = advantages_grouped.view(-1)
         
-        return advantages
+        stats = {
+            "within_group_reward_std": within_group_std,
+            "advantage_mean": advantages.mean().item(),
+            "advantage_std": advantages.std().item(),
+            "advantage_max": advantages.max().item(),
+            "advantage_min": advantages.min().item(),
+        }
+        
+        return advantages, stats
     
     def compute_policy_gradient_loss(
         self,
@@ -280,18 +293,26 @@ class GRPOLoss:
     ) -> Tuple[torch.Tensor, float]:
         """
         Compute KL divergence penalty from reference policy.
+        
+        We approximate the per-token KL using the log-prob difference
+        for the sampled tokens:
+        
+            KL(π || π_ref) ≈ E[log π(a|s) - log π_ref(a|s)]
+        
+        and clamp the mean to be non-negative for numerical stability.
         """
-        kl = log_probs - ref_log_probs
+        log_ratio = log_probs - ref_log_probs
         
         if mask is not None:
-            kl = kl * mask
-            kl_value = kl.sum() / (mask.sum() + 1e-8)
+            log_ratio = log_ratio * mask
+            kl_mean = log_ratio.sum() / (mask.sum() + 1e-8)
         else:
-            kl_value = kl.mean()
+            kl_mean = log_ratio.mean()
         
+        kl_value = torch.clamp(kl_mean, min=0.0)
         kl_penalty = self.kl_coef * kl_value
         
-        return kl_penalty, kl_value.item()
+        return kl_penalty, float(kl_value.item())
     
     def compute_entropy_bonus(
         self,
@@ -651,12 +672,31 @@ class GRPOTrainer:
         # 2. Compute rewards
         rewards = self.compute_rewards(input_ids, attention_mask)
         
-        # 3. Compute group-relative advantages
-        advantages = self.grpo_loss.compute_group_advantages(
-            rewards, self.config.group_size
+        # Store raw reward statistics
+        raw_reward_mean = rewards.mean().item()
+        raw_reward_std = rewards.std().item()
+        raw_reward_max = rewards.max().item()
+        raw_reward_min = rewards.min().item()
+        
+        # 3. Normalize rewards using running statistics for stability
+        if not hasattr(self, 'reward_running_mean'):
+            self.reward_running_mean = raw_reward_mean
+            self.reward_running_std = raw_reward_std + 1e-8
+        else:
+            # Exponential moving average
+            alpha = 0.1
+            self.reward_running_mean = (1 - alpha) * self.reward_running_mean + alpha * raw_reward_mean
+            self.reward_running_std = (1 - alpha) * self.reward_running_std + alpha * (raw_reward_std + 1e-8)
+        
+        # Normalize rewards before computing advantages
+        rewards_normalized = (rewards - self.reward_running_mean) / self.reward_running_std
+        
+        # 4. Compute group-relative advantages using normalized rewards
+        advantages, adv_stats = self.grpo_loss.compute_group_advantages(
+            rewards_normalized, self.config.group_size
         )
         
-        # 4. GRPO update
+        # 5. GRPO update
         update_start = time.time()
         metrics = self.grpo_update(
             input_ids, attention_mask, advantages, prompt_lengths
@@ -664,26 +704,38 @@ class GRPOTrainer:
         update_time = time.time() - update_start
         self.update_times.append(update_time)
         
+        # 6. Adaptive KL coefficient adjustment
+        kl = metrics.get("kl_divergence", 0)
+        target_kl = 0.5  # Target KL divergence
+        if kl > 2.0 * target_kl:
+            self.grpo_loss.kl_coef = min(1.0, self.grpo_loss.kl_coef * 1.5)
+        elif kl < 0.5 * target_kl:
+            self.grpo_loss.kl_coef = max(0.01, self.grpo_loss.kl_coef * 0.8)
+        
         # Track memory
         if torch.cuda.is_available():
             peak_memory = torch.cuda.max_memory_allocated() / 1024**3  # GB
             self.memory_usage.append(peak_memory)
             metrics["peak_memory_gb"] = peak_memory
         
-        # Add additional metrics
-        metrics["reward_mean"] = rewards.mean().item()
-        metrics["reward_std"] = rewards.std().item()
-        metrics["reward_max"] = rewards.max().item()
-        metrics["reward_min"] = rewards.min().item()
+        # Add reward statistics (both raw and normalized)
+        metrics["reward_mean"] = raw_reward_mean
+        metrics["reward_std"] = raw_reward_std
+        metrics["reward_max"] = raw_reward_max
+        metrics["reward_min"] = raw_reward_min
+        metrics["reward_normalized_mean"] = rewards_normalized.mean().item()
+        metrics["reward_normalized_std"] = rewards_normalized.std().item()
+        
+        # Add advantage statistics
+        metrics.update(adv_stats)
+        
+        # Add timing and other info
         metrics["generation_time"] = gen_time
         metrics["update_time"] = update_time
         metrics["step_time"] = time.time() - start_time
         metrics["group_size"] = self.config.group_size
         metrics["num_responses"] = len(prompts) * self.config.group_size
-        
-        # Compute within-group reward statistics
-        rewards_grouped = rewards.view(-1, self.config.group_size)
-        metrics["within_group_std_mean"] = rewards_grouped.std(dim=1).mean().item()
+        metrics["kl_coef"] = self.grpo_loss.kl_coef
         
         self.global_step += 1
         self.training_stats.append(metrics)
@@ -744,7 +796,7 @@ class GRPOTrainer:
                 print(f"\nStep {step + 1}: "
                       f"reward={metrics['reward_mean']:.3f}±{metrics['reward_std']:.3f}, "
                       f"kl={metrics['kl_divergence']:.4f}, "
-                      f"adv_std={metrics['advantage_std']:.3f}, "
+                      f"entropy={metrics.get('entropy', 0):.4f}, "
                       f"loss={metrics['total_loss']:.4f}")
         
         pbar.close()
@@ -771,6 +823,22 @@ class GRPOTrainer:
             "peak_memory_gb": max(self.memory_usage) if self.memory_usage else 0,
             "avg_memory_gb": np.mean(self.memory_usage) if self.memory_usage else 0,
         }
+    
+    def save_model(self, output_dir: str):
+        """
+        Save the trained policy model.
+        
+        Args:
+            output_dir: Directory to save the model
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save the policy model
+        self.policy.model.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        
+        print(f"GRPO policy model saved to {output_dir}")
 
 
 def create_grpo_trainer(
@@ -796,6 +864,7 @@ def create_grpo_trainer(
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # Required for decoder-only models during generation
     
     # Create policy model
     print(f"Loading GRPO policy model from {config.model_name}...")
