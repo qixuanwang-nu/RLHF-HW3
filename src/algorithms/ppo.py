@@ -339,15 +339,16 @@ class PPOLoss:
         # 2. Strong penalty when entropy drops below threshold
         # Minimum entropy threshold (GPT-2 natural text entropy is ~3-5)
         # Uses a quadratic penalty that increases sharply as entropy drops
-        if entropy_value < self.min_entropy:
+        entropy_val_float = entropy_value.item()
+        if entropy_val_float < self.min_entropy:
             # Penalty scales quadratically with how far below threshold we are
-            entropy_deficit = self.min_entropy - entropy_value
+            entropy_deficit = self.min_entropy - entropy_val_float
             collapse_penalty = 5.0 * (entropy_deficit ** 2)  # Strong quadratic penalty
             entropy_loss = entropy_bonus + collapse_penalty
         else:
             entropy_loss = entropy_bonus
         
-        return entropy_loss, entropy_value.item()
+        return entropy_loss, entropy_val_float
     
     def compute_value_loss(
         self,
