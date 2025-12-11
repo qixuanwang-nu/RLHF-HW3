@@ -31,9 +31,10 @@ class PPOConfig:
     
     # PPO hyperparameters
     clip_ratio: float = 0.2  # ε in clipped surrogate
-    kl_coef: float = 0.2  # β for KL penalty (increased for stability)
-    entropy_coef: float = 0.05  # Entropy bonus coefficient (increased to prevent collapse)
+    kl_coef: float = 0.1  # β for KL penalty
+    entropy_coef: float = 0.01  # Entropy bonus coefficient (works with min_entropy threshold)
     value_coef: float = 0.5  # Value loss coefficient
+    min_entropy: float = 1.0  # Minimum entropy threshold to prevent collapse
     
     # Training settings
     learning_rate: float = 1e-5
@@ -177,7 +178,7 @@ class PPOLoss:
     PPO Loss computation with all components:
     - Clipped surrogate objective
     - KL divergence penalty
-    - Entropy bonus
+    - Entropy bonus with minimum threshold
     - Value function loss
     """
     
@@ -187,6 +188,7 @@ class PPOLoss:
         self.kl_coef = config.kl_coef
         self.entropy_coef = config.entropy_coef
         self.value_coef = config.value_coef
+        self.min_entropy = getattr(config, 'min_entropy', 1.0)
     
     def compute_policy_loss(
         self,
@@ -304,11 +306,11 @@ class PPOLoss:
         mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, float]:
         """
-        Compute entropy bonus for exploration.
+        Compute entropy bonus for exploration with minimum entropy threshold.
         
-        We maximize entropy to prevent mode collapse. The entropy term is
-        SUBTRACTED from the loss (equivalently, we add -entropy_coef * entropy).
-        Higher entropy = lower loss = optimizer encouraged to maintain diversity.
+        Uses a two-part strategy to prevent entropy collapse:
+        1. Standard entropy maximization: -entropy_coef * entropy
+        2. Minimum entropy penalty: heavily penalizes entropy below threshold
         
         Args:
             logits: Policy logits [batch, seq_len, vocab_size]
@@ -330,10 +332,20 @@ class PPOLoss:
         else:
             entropy_value = entropy.mean()
         
-        # Maximize entropy by adding -entropy_coef * entropy to loss
-        # When entropy is high: entropy_loss is negative -> lower total loss -> good
-        # When entropy is low: entropy_loss is less negative -> higher total loss -> penalized
-        entropy_loss = -self.entropy_coef * entropy_value
+        # Two-part entropy regularization:
+        # 1. Standard entropy maximization (always active)
+        entropy_bonus = -self.entropy_coef * entropy_value
+        
+        # 2. Strong penalty when entropy drops below threshold
+        # Minimum entropy threshold (GPT-2 natural text entropy is ~3-5)
+        # Uses a quadratic penalty that increases sharply as entropy drops
+        if entropy_value < self.min_entropy:
+            # Penalty scales quadratically with how far below threshold we are
+            entropy_deficit = self.min_entropy - entropy_value
+            collapse_penalty = 5.0 * (entropy_deficit ** 2)  # Strong quadratic penalty
+            entropy_loss = entropy_bonus + collapse_penalty
+        else:
+            entropy_loss = entropy_bonus
         
         return entropy_loss, entropy_value.item()
     
