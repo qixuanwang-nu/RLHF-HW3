@@ -283,18 +283,19 @@ class PPOLoss:
             kl_value: Raw KL divergence value
         """
         log_ratio = log_probs - ref_log_probs
-        # Clamp to prevent numerical issues with exp
-        log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
-        ratio = torch.exp(log_ratio)
         
-        # k3 estimator: 0.5 * (r - 1)^2, always non-negative
-        kl_approx = 0.5 * (ratio - 1) ** 2
+        # Use absolute log ratio as KL approximation (simpler and stable)
+        # This measures how much the log probs differ, always positive
+        kl_approx = log_ratio.abs()
         
         if mask is not None:
             kl_approx = kl_approx * mask
             kl_value = kl_approx.sum() / (mask.sum() + 1e-8)
         else:
             kl_value = kl_approx.mean()
+        
+        # Clamp KL value to prevent explosion
+        kl_value = torch.clamp(kl_value, 0.0, 100.0)
         
         kl_penalty = self.kl_coef * kl_value
         
@@ -332,18 +333,19 @@ class PPOLoss:
         else:
             entropy_value = entropy.mean()
         
-        # Two-part entropy regularization:
-        # 1. Standard entropy maximization (always active)
+        # Entropy maximization: subtract entropy from loss (or add negative entropy)
+        # Higher entropy = more exploration = better
+        # We want to MAXIMIZE entropy, so we SUBTRACT it from loss (add negative)
         entropy_bonus = -self.entropy_coef * entropy_value
         
-        # 2. Strong penalty when entropy drops below threshold
-        # Minimum entropy threshold (GPT-2 natural text entropy is ~3-5)
-        # Uses a quadratic penalty that increases sharply as entropy drops
+        # Strong penalty when entropy drops below threshold
+        # GPT-2 natural text entropy is ~3-5, so threshold of 1.0 is conservative
         entropy_val_float = entropy_value.item()
         if entropy_val_float < self.min_entropy:
-            # Penalty scales quadratically with how far below threshold we are
+            # Use exponential penalty for entropy collapse - much stronger than quadratic
             entropy_deficit = self.min_entropy - entropy_val_float
-            collapse_penalty = 5.0 * (entropy_deficit ** 2)  # Strong quadratic penalty
+            # Scale: if entropy=0.1 and threshold=1.0, deficit=0.9, penalty=50*(0.9)^1.5=38
+            collapse_penalty = 50.0 * (entropy_deficit ** 1.5)
             entropy_loss = entropy_bonus + collapse_penalty
         else:
             entropy_loss = entropy_bonus

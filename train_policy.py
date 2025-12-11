@@ -71,12 +71,12 @@ def parse_args():
                         help="PPO clip ratio")
     parser.add_argument("--ppo_epochs", type=int, default=4,
                         help="PPO epochs per batch")
-    parser.add_argument("--kl_coef", type=float, default=0.1,
-                        help="KL penalty coefficient")
-    parser.add_argument("--entropy_coef", type=float, default=0.01,
-                        help="Entropy bonus coefficient (works with min_entropy threshold)")
-    parser.add_argument("--min_entropy", type=float, default=1.0,
-                        help="Minimum entropy threshold to prevent mode collapse")
+    parser.add_argument("--kl_coef", type=float, default=0.2,
+                        help="KL penalty coefficient (0.1-0.5 recommended)")
+    parser.add_argument("--entropy_coef", type=float, default=0.1,
+                        help="Entropy bonus coefficient (0.05-0.2 recommended)")
+    parser.add_argument("--min_entropy", type=float, default=2.0,
+                        help="Minimum entropy threshold (GPT-2 text ~3-5, set to 2.0)")
     
     # GRPO specific
     parser.add_argument("--group_size", type=int, default=4,
