@@ -515,7 +515,7 @@ class PPOTrainer:
         self,
         prompts: List[str],
         max_new_tokens: Optional[int] = None
-    ) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate responses for a batch of prompts.
         
@@ -527,6 +527,7 @@ class PPOTrainer:
             responses: List of generated response strings
             input_ids: Full sequence token IDs
             attention_mask: Attention masks
+            response_mask: Mask that isolates generated tokens (excludes prompt)
         """
         self.policy.eval()
         
@@ -567,7 +568,12 @@ class PPOTrainer:
         # Create attention mask for full sequence
         full_attention_mask = (output_ids != self.tokenizer.pad_token_id).long()
         
-        return responses, output_ids, full_attention_mask
+        # Mask only the generated tokens (drop prompt and padding)
+        response_mask = full_attention_mask.clone()
+        prompt_seq_len = input_ids.size(1)
+        response_mask[:, :prompt_seq_len] = 0
+        
+        return responses, output_ids, full_attention_mask, response_mask
     
     @torch.no_grad()
     def compute_rewards(
@@ -647,9 +653,11 @@ class PPOTrainer:
                 returns[i, t] = advantages[i, t] + values[i, t]
         
         # Normalize advantages
-        adv_mean = advantages[response_mask.bool()].mean()
-        adv_std = advantages[response_mask.bool()].std() + 1e-8
-        advantages = (advantages - adv_mean) / adv_std
+        masked_adv = advantages[response_mask.bool()]
+        if masked_adv.numel() > 0:
+            adv_mean = masked_adv.mean()
+            adv_std = masked_adv.std() + 1e-8
+            advantages = (advantages - adv_mean) / adv_std
         
         return advantages, returns
     
@@ -792,7 +800,7 @@ class PPOTrainer:
         start_time = time.time()
         
         # 1. Generate responses
-        responses, full_ids, attention_mask = self.generate_responses(prompts)
+        responses, full_ids, attention_mask, response_mask = self.generate_responses(prompts)
         
         # 2. Compute rewards and normalize
         raw_rewards = self.compute_rewards(full_ids, attention_mask)
@@ -818,25 +826,10 @@ class PPOTrainer:
             
             ref_log_probs = self.ref_policy.get_log_probs(full_ids, attention_mask)
         
-        # 4. Create response mask (tokens after prompt)
-        # For simplicity, mark all tokens as part of response
-        # In practice, you'd track prompt length
-        prompt_encoded = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        )
-        prompt_lengths = prompt_encoded["attention_mask"].sum(dim=1)
-        
-        response_mask = torch.zeros_like(attention_mask)
-        for i, prompt_len in enumerate(prompt_lengths):
-            response_mask[i, prompt_len:] = attention_mask[i, prompt_len:]
-        
-        # 5. Compute advantages using GAE
+        # 4. Compute advantages using GAE (mask excludes prompt tokens)
         advantages, returns = self.compute_advantages_gae(rewards, old_values, response_mask)
         
-        # 6. PPO update
+        # 5. PPO update
         metrics = self.ppo_update(
             full_ids, attention_mask,
             old_log_probs, ref_log_probs, old_values,
@@ -984,4 +977,3 @@ if __name__ == "__main__":
     # Quick test
     print("PPO module loaded successfully.")
     print(f"PPOConfig defaults: clip_ratio={PPOConfig.clip_ratio}, kl_coef={PPOConfig.kl_coef}")
-

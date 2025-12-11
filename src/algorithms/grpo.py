@@ -265,22 +265,27 @@ class GRPOLoss:
             metrics: Dictionary of metrics
         """
         # For sequence-level advantages, expand to match token-level log_probs
+        adv_expanded = advantages
         if advantages.dim() == 1 and log_probs.dim() == 2:
-            advantages = advantages.unsqueeze(1).expand_as(log_probs)
+            adv_expanded = advantages.unsqueeze(1)
+        if log_probs.dim() == 2 and adv_expanded.dim() == 2 and adv_expanded.shape[1] != log_probs.shape[1]:
+            adv_expanded = adv_expanded.expand(-1, log_probs.shape[1])
         
-        # Policy gradient
-        pg_loss = -log_probs * advantages.detach()
-        
-        if mask is not None:
-            pg_loss = pg_loss * mask
-            loss = pg_loss.sum() / (mask.sum() + 1e-8)
+        # Policy gradient (length-normalized per sequence to reduce length bias)
+        if mask is not None and log_probs.dim() == 2:
+            pg_loss = -log_probs * adv_expanded.detach() * mask
+            token_counts = mask.sum(dim=1) + 1e-8
+            loss = (pg_loss.sum(dim=1) / token_counts).mean()
+            valid_adv = adv_expanded[mask.bool()] if mask.bool().any() else adv_expanded
         else:
+            pg_loss = -log_probs * adv_expanded.detach()
             loss = pg_loss.mean()
+            valid_adv = adv_expanded
         
         metrics = {
             "policy_loss": loss.item(),
-            "advantage_mean": advantages.mean().item(),
-            "advantage_std": advantages.std().item(),
+            "advantage_mean": valid_adv.mean().item(),
+            "advantage_std": valid_adv.std().item(),
         }
         
         return loss, metrics
@@ -482,7 +487,7 @@ class GRPOTrainer:
             responses: List of lists of response strings [batch_size, group_size]
             all_input_ids: Token IDs for all responses [batch_size * group_size, seq_len]
             all_attention_masks: Attention masks
-            prompt_lengths: Length of each prompt
+            prompt_token_lengths: Tokenized prompt lengths (padded length) per prompt
         """
         self.policy.eval()
         
@@ -500,7 +505,7 @@ class GRPOTrainer:
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
         
-        prompt_lengths = attention_mask.sum(dim=1).tolist()
+        prompt_token_lengths = [input_ids.size(1)] * len(prompts)
         
         all_responses = []
         all_input_ids = []
@@ -568,7 +573,7 @@ class GRPOTrainer:
         all_input_ids = torch.cat(padded_ids, dim=0)
         all_attention_masks = torch.cat(padded_masks, dim=0)
         
-        return all_responses, all_input_ids, all_attention_masks, prompt_lengths
+        return all_responses, all_input_ids, all_attention_masks, prompt_token_lengths
     
     @torch.no_grad()
     def compute_rewards(
@@ -587,7 +592,7 @@ class GRPOTrainer:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         advantages: torch.Tensor,
-        prompt_lengths: List[int]
+        prompt_token_lengths: List[int]
     ) -> Dict[str, float]:
         """
         Perform GRPO update.
@@ -596,7 +601,7 @@ class GRPOTrainer:
             input_ids: Token IDs [batch_size * group_size, seq_len]
             attention_mask: Attention mask
             advantages: Group-relative advantages [batch_size * group_size]
-            prompt_lengths: Prompt lengths for creating response masks
+            prompt_token_lengths: Tokenized prompt lengths (padded) for creating response masks
             
         Returns:
             metrics: Training metrics
@@ -604,12 +609,12 @@ class GRPOTrainer:
         self.policy.train()
         
         # Create response masks
-        batch_size = len(prompt_lengths)
+        batch_size = len(prompt_token_lengths)
         group_size = self.config.group_size
         seq_len = input_ids.size(1)
         
         response_mask = torch.zeros_like(attention_mask, dtype=torch.float)
-        for i, prompt_len in enumerate(prompt_lengths):
+        for i, prompt_len in enumerate(prompt_token_lengths):
             for j in range(group_size):
                 idx = i * group_size + j
                 response_mask[idx, prompt_len:] = attention_mask[idx, prompt_len:].float()
@@ -682,7 +687,7 @@ class GRPOTrainer:
         
         # 1. Generate group responses
         gen_start = time.time()
-        responses, input_ids, attention_mask, prompt_lengths = self.generate_group_responses(prompts)
+        responses, input_ids, attention_mask, prompt_token_lengths = self.generate_group_responses(prompts)
         gen_time = time.time() - gen_start
         self.generation_times.append(gen_time)
         
@@ -716,7 +721,7 @@ class GRPOTrainer:
         # 5. GRPO update
         update_start = time.time()
         metrics = self.grpo_update(
-            input_ids, attention_mask, advantages, prompt_lengths
+            input_ids, attention_mask, advantages, prompt_token_lengths
         )
         update_time = time.time() - update_start
         self.update_times.append(update_time)
@@ -906,4 +911,3 @@ def create_grpo_trainer(
 if __name__ == "__main__":
     print("GRPO module loaded successfully.")
     print(f"GRPOConfig defaults: group_size={GRPOConfig.group_size}, kl_coef={GRPOConfig.kl_coef}")
-
