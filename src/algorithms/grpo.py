@@ -265,27 +265,22 @@ class GRPOLoss:
             metrics: Dictionary of metrics
         """
         # For sequence-level advantages, expand to match token-level log_probs
-        adv_expanded = advantages
         if advantages.dim() == 1 and log_probs.dim() == 2:
-            adv_expanded = advantages.unsqueeze(1)
-        if log_probs.dim() == 2 and adv_expanded.dim() == 2 and adv_expanded.shape[1] != log_probs.shape[1]:
-            adv_expanded = adv_expanded.expand(-1, log_probs.shape[1])
+            advantages = advantages.unsqueeze(1).expand_as(log_probs)
         
-        # Policy gradient (length-normalized per sequence to reduce length bias)
-        if mask is not None and log_probs.dim() == 2:
-            pg_loss = -log_probs * adv_expanded.detach() * mask
-            token_counts = mask.sum(dim=1) + 1e-8
-            loss = (pg_loss.sum(dim=1) / token_counts).mean()
-            valid_adv = adv_expanded[mask.bool()] if mask.bool().any() else adv_expanded
+        # Policy gradient
+        pg_loss = -log_probs * advantages.detach()
+        
+        if mask is not None:
+            pg_loss = pg_loss * mask
+            loss = pg_loss.sum() / (mask.sum() + 1e-8)
         else:
-            pg_loss = -log_probs * adv_expanded.detach()
             loss = pg_loss.mean()
-            valid_adv = adv_expanded
         
         metrics = {
             "policy_loss": loss.item(),
-            "advantage_mean": valid_adv.mean().item(),
-            "advantage_std": valid_adv.std().item(),
+            "advantage_mean": advantages.mean().item(),
+            "advantage_std": advantages.std().item(),
         }
         
         return loss, metrics
@@ -333,13 +328,14 @@ class GRPOLoss:
         """
         Compute entropy bonus for exploration.
         
-        We use a target entropy approach: encourage entropy to stay
-        near a target value (not too low = mode collapse, not too high = random).
-        For GPT-2, a reasonable target is around 3-5 (concentrated but not collapsed).
+        We maximize entropy to prevent mode collapse. The entropy term is
+        SUBTRACTED from the loss (equivalently, we add -entropy_coef * entropy).
+        Higher entropy = lower loss = optimizer encouraged to maintain diversity.
         """
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
         
+        # Entropy per position: H = -sum(p * log(p))
         entropy = -(probs * log_probs).sum(dim=-1)
         
         if mask is not None:
@@ -348,16 +344,12 @@ class GRPOLoss:
         else:
             entropy_value = entropy.mean()
         
-        # Target entropy approach: penalize deviation from target
-        # GPT-2 base model typically has entropy around 3-5 for natural text
-        target_entropy = 4.0
+        # Maximize entropy by adding -entropy_coef * entropy to loss
+        # When entropy is high: entropy_loss is negative -> lower total loss -> good
+        # When entropy is low: entropy_loss is less negative -> higher total loss -> penalized
+        entropy_loss = -self.entropy_coef * entropy_value
         
-        # If entropy is below target, encourage higher entropy (negative bonus = lower loss)
-        # If entropy is above target, discourage higher entropy (positive bonus = higher loss)
-        entropy_deviation = entropy_value - target_entropy
-        entropy_bonus = self.entropy_coef * entropy_deviation
-        
-        return entropy_bonus, entropy_value.item()
+        return entropy_loss, entropy_value.item()
     
     def compute_total_loss(
         self,
@@ -393,17 +385,17 @@ class GRPOLoss:
             log_probs, ref_log_probs, mask
         )
         
-        # Entropy bonus
-        entropy_bonus, entropy_value = self.compute_entropy_bonus(logits, mask)
+        # Entropy loss (negative = encourages higher entropy)
+        entropy_loss, entropy_value = self.compute_entropy_bonus(logits, mask)
         
-        # Total loss
-        total_loss = pg_loss + kl_penalty + entropy_bonus
+        # Total loss: policy gradient + KL penalty + entropy regularization
+        total_loss = pg_loss + kl_penalty + entropy_loss
         
         metrics = {
             **pg_metrics,
             "kl_penalty": kl_penalty.item(),
             "kl_divergence": kl_value,
-            "entropy_bonus": -entropy_bonus.item(),
+            "entropy_bonus": -entropy_loss.item(),  # Positive value = entropy being encouraged
             "entropy": entropy_value,
             "total_loss": total_loss.item(),
         }
@@ -487,7 +479,7 @@ class GRPOTrainer:
             responses: List of lists of response strings [batch_size, group_size]
             all_input_ids: Token IDs for all responses [batch_size * group_size, seq_len]
             all_attention_masks: Attention masks
-            prompt_token_lengths: Tokenized prompt lengths (padded length) per prompt
+            prompt_lengths: Length of each prompt
         """
         self.policy.eval()
         
@@ -505,7 +497,7 @@ class GRPOTrainer:
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
         
-        prompt_token_lengths = [input_ids.size(1)] * len(prompts)
+        prompt_lengths = attention_mask.sum(dim=1).tolist()
         
         all_responses = []
         all_input_ids = []
@@ -573,7 +565,7 @@ class GRPOTrainer:
         all_input_ids = torch.cat(padded_ids, dim=0)
         all_attention_masks = torch.cat(padded_masks, dim=0)
         
-        return all_responses, all_input_ids, all_attention_masks, prompt_token_lengths
+        return all_responses, all_input_ids, all_attention_masks, prompt_lengths
     
     @torch.no_grad()
     def compute_rewards(
@@ -592,7 +584,7 @@ class GRPOTrainer:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         advantages: torch.Tensor,
-        prompt_token_lengths: List[int]
+        prompt_lengths: List[int]
     ) -> Dict[str, float]:
         """
         Perform GRPO update.
@@ -601,7 +593,7 @@ class GRPOTrainer:
             input_ids: Token IDs [batch_size * group_size, seq_len]
             attention_mask: Attention mask
             advantages: Group-relative advantages [batch_size * group_size]
-            prompt_token_lengths: Tokenized prompt lengths (padded) for creating response masks
+            prompt_lengths: Prompt lengths for creating response masks
             
         Returns:
             metrics: Training metrics
@@ -609,12 +601,12 @@ class GRPOTrainer:
         self.policy.train()
         
         # Create response masks
-        batch_size = len(prompt_token_lengths)
+        batch_size = len(prompt_lengths)
         group_size = self.config.group_size
         seq_len = input_ids.size(1)
         
         response_mask = torch.zeros_like(attention_mask, dtype=torch.float)
-        for i, prompt_len in enumerate(prompt_token_lengths):
+        for i, prompt_len in enumerate(prompt_lengths):
             for j in range(group_size):
                 idx = i * group_size + j
                 response_mask[idx, prompt_len:] = attention_mask[idx, prompt_len:].float()
@@ -687,7 +679,7 @@ class GRPOTrainer:
         
         # 1. Generate group responses
         gen_start = time.time()
-        responses, input_ids, attention_mask, prompt_token_lengths = self.generate_group_responses(prompts)
+        responses, input_ids, attention_mask, prompt_lengths = self.generate_group_responses(prompts)
         gen_time = time.time() - gen_start
         self.generation_times.append(gen_time)
         
@@ -721,7 +713,7 @@ class GRPOTrainer:
         # 5. GRPO update
         update_start = time.time()
         metrics = self.grpo_update(
-            input_ids, attention_mask, advantages, prompt_token_lengths
+            input_ids, attention_mask, advantages, prompt_lengths
         )
         update_time = time.time() - update_start
         self.update_times.append(update_time)
@@ -911,3 +903,4 @@ def create_grpo_trainer(
 if __name__ == "__main__":
     print("GRPO module loaded successfully.")
     print(f"GRPOConfig defaults: group_size={GRPOConfig.group_size}, kl_coef={GRPOConfig.kl_coef}")
+

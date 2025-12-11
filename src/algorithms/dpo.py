@@ -7,7 +7,6 @@ Reference: "Direct Preference Optimization: Your Language Model is Secretly a Re
 https://arxiv.org/abs/2305.18290
 """
 
-import math
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -254,10 +253,15 @@ class DPOLoss:
             loss: Scalar loss
             metrics: Dictionary of metrics
         """
-        # Compute log ratios
+        # Compute log ratios with clamping for numerical stability
         # π(y|x) / π_ref(y|x) = exp(log π(y|x) - log π_ref(y|x))
         chosen_log_ratios = policy_chosen_logps - ref_chosen_logps
         rejected_log_ratios = policy_rejected_logps - ref_rejected_logps
+        
+        # Clamp log ratios to prevent extreme values
+        # This prevents numerical instability when policy diverges too far from reference
+        chosen_log_ratios = torch.clamp(chosen_log_ratios, -10.0, 10.0)
+        rejected_log_ratios = torch.clamp(rejected_log_ratios, -10.0, 10.0)
         
         # Compute preference logits: β * (log π_w/π_ref_w - log π_l/π_ref_l)
         logits = self.beta * (chosen_log_ratios - rejected_log_ratios)
@@ -300,6 +304,14 @@ class DPOLoss:
             # Log ratio statistics
             chosen_log_ratio_mean = chosen_log_ratios.mean()
             rejected_log_ratio_mean = rejected_log_ratios.mean()
+            
+            # Implicit KL divergence from reference (for monitoring)
+            # Using k3 estimator: 0.5 * (exp(log_ratio) - 1)^2
+            chosen_ratio = torch.exp(chosen_log_ratios)
+            rejected_ratio = torch.exp(rejected_log_ratios)
+            implicit_kl_chosen = 0.5 * ((chosen_ratio - 1) ** 2).mean()
+            implicit_kl_rejected = 0.5 * ((rejected_ratio - 1) ** 2).mean()
+            implicit_kl = (implicit_kl_chosen + implicit_kl_rejected) / 2
         
         metrics = {
             "loss": loss.item(),
@@ -311,6 +323,7 @@ class DPOLoss:
             "rejected_log_ratio": rejected_log_ratio_mean.item(),
             "logits_mean": logits.mean().item(),
             "logits_std": logits.std().item(),
+            "implicit_kl": implicit_kl.item(),
         }
         
         return loss, metrics
@@ -361,12 +374,9 @@ class DPOTrainer:
             lr=config.learning_rate,
             weight_decay=config.weight_decay
         )
-        self.optimizer.zero_grad(set_to_none=True)
 
-        # Scheduler will be initialized in train() when we know total update steps
+        # Scheduler will be initialized in train() when we know total steps
         self.scheduler = None
-        self.accumulation_steps = max(1, config.gradient_accumulation_steps)
-        self._micro_step = 0
 
         # Training metrics
         self.training_stats = []
@@ -400,30 +410,18 @@ class DPOTrainer:
         # Get full sequence log probs
         token_log_probs = model.get_log_probs(input_ids, attention_mask, average_log_prob=False)
         
-        # Create mask for response tokens only (exclude prompt), robust to left-padding
+        # Create mask for response tokens only (exclude prompt)
         batch_size, seq_len = token_log_probs.shape
         response_mask = torch.zeros_like(token_log_probs)
         
         for i in range(batch_size):
-            attn = attention_mask[i]
-            prompt_len = int(prompt_lengths[i].item())
-            
-            total_tokens = int(attn.sum().item())
-            if total_tokens == 0:
-                continue
-            
-            # First non-pad token index (handles left padding)
-            first_token_idx = int(attn.nonzero(as_tuple=True)[0][0].item())
-            
-            # Response starts after prompt; log_probs are shifted by 1
-            response_start = max(0, first_token_idx + prompt_len - 1)
-            response_tokens = max(total_tokens - prompt_len, 0)
-            
-            if response_tokens <= 0 or response_start >= seq_len:
-                continue
-            
-            response_end = min(seq_len, response_start + response_tokens)
-            response_mask[i, response_start:response_end] = 1.0
+            prompt_len = prompt_lengths[i].item()
+            # Response starts after prompt (accounting for shift in log_probs)
+            response_start = max(0, prompt_len - 1)
+            # Calculate how many response tokens we have in log_probs
+            response_len = min(seq_len - response_start, attention_mask[i, prompt_len:].sum().item())
+            if response_len > 0:
+                response_mask[i, response_start:response_start + int(response_len)] = 1.0
         
         # Mask out prompt tokens
         masked_log_probs = token_log_probs * response_mask
@@ -485,33 +483,23 @@ class DPOTrainer:
             ref_rejected_logps
         )
         
-        # Backward pass with gradient accumulation
-        loss_scaled = loss / self.accumulation_steps
-        loss_scaled.backward()
-        self._micro_step += 1
-        is_update_step = (self._micro_step % self.accumulation_steps) == 0
+        # Backward pass
+        self.optimizer.zero_grad()
+        loss.backward()
         
-        grad_norm = None
-        if is_update_step:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(),
-                self.config.max_grad_norm
-            )
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            
-            # Step scheduler on optimizer updates
-            if self.scheduler is not None:
-                self.scheduler.step()
-                metrics["learning_rate"] = self.scheduler.get_last_lr()[0]
-            else:
-                metrics["learning_rate"] = self.optimizer.param_groups[0]["lr"]
-        else:
-            # Keep current LR for logging consistency
-            metrics["learning_rate"] = self.optimizer.param_groups[0]["lr"]
-        
-        metrics["grad_norm"] = grad_norm.item() if grad_norm is not None else 0.0
-        metrics["optimizer_step"] = is_update_step
+        # Gradient clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.policy.parameters(),
+            self.config.max_grad_norm
+        )
+        metrics["grad_norm"] = grad_norm.item()
+
+        self.optimizer.step()
+
+        # Step scheduler if initialized
+        if self.scheduler is not None:
+            self.scheduler.step()
+            metrics["learning_rate"] = self.scheduler.get_last_lr()[0]
         
         # Track timing and memory
         step_time = time.time() - start_time
@@ -546,16 +534,15 @@ class DPOTrainer:
             training_stats: List of training metrics
         """
         total_steps = len(dataloader) * num_epochs
-        update_steps = math.ceil(total_steps / self.accumulation_steps)
 
         # Initialize learning rate scheduler with warmup
-        warmup_steps = int(update_steps * self.config.warmup_ratio)
+        warmup_steps = int(total_steps * self.config.warmup_ratio)
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=warmup_steps,
-            num_training_steps=update_steps
+            num_training_steps=total_steps
         )
-        print(f"LR scheduler: {warmup_steps} warmup steps, {update_steps} optimizer steps ({total_steps} micro-steps)")
+        print(f"LR scheduler: {warmup_steps} warmup steps, {total_steps} total steps")
 
         pbar = tqdm(total=total_steps, desc="DPO Training")
         
@@ -582,22 +569,6 @@ class DPOTrainer:
                           f"rejected_r={metrics['rejected_rewards']:.4f}")
         
         pbar.close()
-        
-        # Flush any remaining gradients if the last micro-batch did not trigger an optimizer step
-        if (self._micro_step % self.accumulation_steps) != 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(),
-                self.config.max_grad_norm
-            )
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            if self.scheduler is not None:
-                self.scheduler.step()
-            if self.training_stats:
-                # Update the last logged metrics to reflect the optimizer step
-                self.training_stats[-1]["grad_norm"] = grad_norm.item()
-                self.training_stats[-1]["optimizer_step"] = True
-                self.training_stats[-1]["learning_rate"] = self.optimizer.param_groups[0]["lr"]
         
         # Print efficiency summary
         print("\n" + "="*60)
@@ -795,3 +766,4 @@ if __name__ == "__main__":
     print(f"\nTest loss: {loss.item():.4f}")
     print(f"Test accuracy: {metrics['accuracy']:.4f}")
     print(f"Test margin: {metrics['reward_margin']:.4f}")
+

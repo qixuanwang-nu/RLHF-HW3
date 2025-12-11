@@ -306,22 +306,22 @@ class PPOLoss:
         """
         Compute entropy bonus for exploration.
         
-        Uses a target entropy approach: encourage entropy to stay
-        near a target value (not too low = mode collapse, not too high = random).
-        For GPT-2, a reasonable target is around 3-5 (concentrated but not collapsed).
+        We maximize entropy to prevent mode collapse. The entropy term is
+        SUBTRACTED from the loss (equivalently, we add -entropy_coef * entropy).
+        Higher entropy = lower loss = optimizer encouraged to maintain diversity.
         
         Args:
             logits: Policy logits [batch, seq_len, vocab_size]
             mask: Mask for valid tokens
             
         Returns:
-            entropy_bonus: Weighted entropy bonus
+            entropy_loss: Entropy term to ADD to loss (negative of bonus)
             entropy_value: Raw entropy value
         """
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
         
-        # Entropy per position
+        # Entropy per position: H = -sum(p * log(p))
         entropy = -(probs * log_probs).sum(dim=-1)
         
         if mask is not None:
@@ -330,16 +330,12 @@ class PPOLoss:
         else:
             entropy_value = entropy.mean()
         
-        # Target entropy approach: penalize deviation from target
-        # GPT-2 base model typically has entropy around 3-5 for natural text
-        target_entropy = 4.0
+        # Maximize entropy by adding -entropy_coef * entropy to loss
+        # When entropy is high: entropy_loss is negative -> lower total loss -> good
+        # When entropy is low: entropy_loss is less negative -> higher total loss -> penalized
+        entropy_loss = -self.entropy_coef * entropy_value
         
-        # If entropy is below target, encourage higher entropy (negative bonus = lower loss)
-        # If entropy is above target, discourage higher entropy (positive bonus = higher loss)
-        entropy_deviation = entropy_value - target_entropy
-        entropy_bonus = self.entropy_coef * entropy_deviation
-        
-        return entropy_bonus, entropy_value.item()
+        return entropy_loss, entropy_value.item()
     
     def compute_value_loss(
         self,
@@ -426,22 +422,22 @@ class PPOLoss:
             log_probs, ref_log_probs, mask
         )
         
-        # Entropy bonus
-        entropy_bonus, entropy_value = self.compute_entropy_bonus(logits, mask)
+        # Entropy loss (negative = encourages higher entropy)
+        entropy_loss, entropy_value = self.compute_entropy_bonus(logits, mask)
         
         # Value loss
         value_loss, value_loss_raw = self.compute_value_loss(
             values, returns, old_values, mask
         )
         
-        # Total loss
-        total_loss = policy_loss + kl_penalty + entropy_bonus + value_loss
+        # Total loss: policy + KL penalty + entropy regularization + value
+        total_loss = policy_loss + kl_penalty + entropy_loss + value_loss
         
         metrics = {
             **policy_metrics,
             "kl_penalty": kl_penalty.item(),
             "kl_divergence": kl_value,
-            "entropy_bonus": -entropy_bonus.item(),  # Make positive for logging
+            "entropy_bonus": -entropy_loss.item(),  # Positive value = entropy being encouraged
             "entropy": entropy_value,
             "value_loss": value_loss_raw,
             "total_loss": total_loss.item(),
@@ -515,7 +511,7 @@ class PPOTrainer:
         self,
         prompts: List[str],
         max_new_tokens: Optional[int] = None
-    ) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
         """
         Generate responses for a batch of prompts.
         
@@ -527,7 +523,6 @@ class PPOTrainer:
             responses: List of generated response strings
             input_ids: Full sequence token IDs
             attention_mask: Attention masks
-            response_mask: Mask that isolates generated tokens (excludes prompt)
         """
         self.policy.eval()
         
@@ -568,12 +563,7 @@ class PPOTrainer:
         # Create attention mask for full sequence
         full_attention_mask = (output_ids != self.tokenizer.pad_token_id).long()
         
-        # Mask only the generated tokens (drop prompt and padding)
-        response_mask = full_attention_mask.clone()
-        prompt_seq_len = input_ids.size(1)
-        response_mask[:, :prompt_seq_len] = 0
-        
-        return responses, output_ids, full_attention_mask, response_mask
+        return responses, output_ids, full_attention_mask
     
     @torch.no_grad()
     def compute_rewards(
@@ -653,11 +643,9 @@ class PPOTrainer:
                 returns[i, t] = advantages[i, t] + values[i, t]
         
         # Normalize advantages
-        masked_adv = advantages[response_mask.bool()]
-        if masked_adv.numel() > 0:
-            adv_mean = masked_adv.mean()
-            adv_std = masked_adv.std() + 1e-8
-            advantages = (advantages - adv_mean) / adv_std
+        adv_mean = advantages[response_mask.bool()].mean()
+        adv_std = advantages[response_mask.bool()].std() + 1e-8
+        advantages = (advantages - adv_mean) / adv_std
         
         return advantages, returns
     
@@ -800,7 +788,7 @@ class PPOTrainer:
         start_time = time.time()
         
         # 1. Generate responses
-        responses, full_ids, attention_mask, response_mask = self.generate_responses(prompts)
+        responses, full_ids, attention_mask = self.generate_responses(prompts)
         
         # 2. Compute rewards and normalize
         raw_rewards = self.compute_rewards(full_ids, attention_mask)
@@ -826,10 +814,25 @@ class PPOTrainer:
             
             ref_log_probs = self.ref_policy.get_log_probs(full_ids, attention_mask)
         
-        # 4. Compute advantages using GAE (mask excludes prompt tokens)
+        # 4. Create response mask (tokens after prompt)
+        # For simplicity, mark all tokens as part of response
+        # In practice, you'd track prompt length
+        prompt_encoded = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        )
+        prompt_lengths = prompt_encoded["attention_mask"].sum(dim=1)
+        
+        response_mask = torch.zeros_like(attention_mask)
+        for i, prompt_len in enumerate(prompt_lengths):
+            response_mask[i, prompt_len:] = attention_mask[i, prompt_len:]
+        
+        # 5. Compute advantages using GAE
         advantages, returns = self.compute_advantages_gae(rewards, old_values, response_mask)
         
-        # 5. PPO update
+        # 6. PPO update
         metrics = self.ppo_update(
             full_ids, attention_mask,
             old_log_probs, ref_log_probs, old_values,
@@ -977,3 +980,4 @@ if __name__ == "__main__":
     # Quick test
     print("PPO module loaded successfully.")
     print(f"PPOConfig defaults: clip_ratio={PPOConfig.clip_ratio}, kl_coef={PPOConfig.kl_coef}")
+
