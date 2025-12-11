@@ -71,10 +71,12 @@ def parse_args():
                         help="PPO clip ratio")
     parser.add_argument("--ppo_epochs", type=int, default=4,
                         help="PPO epochs per batch")
-    parser.add_argument("--kl_coef", type=float, default=0.5,
-                        help="KL penalty coefficient (higher = more stable)")
-    parser.add_argument("--entropy_coef", type=float, default=0.1,
-                        help="Entropy bonus coefficient (higher = prevents mode collapse)")
+    parser.add_argument("--kl_coef", type=float, default=0.1,
+                        help="KL penalty coefficient")
+    parser.add_argument("--entropy_coef", type=float, default=0.01,
+                        help="Entropy bonus coefficient (works with min_entropy threshold)")
+    parser.add_argument("--min_entropy", type=float, default=1.0,
+                        help="Minimum entropy threshold to prevent mode collapse")
     
     # GRPO specific
     parser.add_argument("--group_size", type=int, default=4,
@@ -86,6 +88,8 @@ def parse_args():
     parser.add_argument("--dpo_loss_type", type=str, default="sigmoid",
                         choices=["sigmoid", "hinge", "ipo"],
                         help="DPO loss type")
+    parser.add_argument("--dpo_lr", type=float, default=1e-6,
+                        help="DPO learning rate (lower than PPO/GRPO)")
     
     # Generation
     parser.add_argument("--max_new_tokens", type=int, default=64,
@@ -188,6 +192,7 @@ def train_ppo(
         clip_ratio=args.clip_ratio,
         kl_coef=args.kl_coef,
         entropy_coef=args.entropy_coef,
+        min_entropy=args.min_entropy,
         learning_rate=args.lr,
         batch_size=args.batch_size,
         ppo_epochs=args.ppo_epochs,
@@ -200,6 +205,7 @@ def train_ppo(
     print(f"  Clip ratio: {config.clip_ratio}")
     print(f"  KL coefficient: {config.kl_coef}")
     print(f"  Entropy coefficient: {config.entropy_coef}")
+    print(f"  Min entropy threshold: {config.min_entropy}")
     print(f"  PPO epochs: {config.ppo_epochs}")
     print(f"  Batch size: {config.batch_size}")
     
@@ -266,6 +272,7 @@ def train_grpo(
         group_size=args.group_size,
         kl_coef=args.kl_coef,
         entropy_coef=args.entropy_coef,
+        min_entropy=args.min_entropy,
         learning_rate=args.lr,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
@@ -277,6 +284,7 @@ def train_grpo(
     print(f"  Group size: {config.group_size}")
     print(f"  KL coefficient: {config.kl_coef}")
     print(f"  Entropy coefficient: {config.entropy_coef}")
+    print(f"  Min entropy threshold: {config.min_entropy}")
     print(f"  Batch size: {config.batch_size}")
     print(f"  Effective responses per step: {config.batch_size * config.group_size}")
     
@@ -341,12 +349,12 @@ def train_dpo(
     print("="*60)
     print("Note: DPO bypasses reward modeling - learning directly from preferences")
     
-    # Create config
+    # Create config (DPO uses lower learning rate than PPO/GRPO)
     config = DPOConfig(
         model_name=args.model_name,
         beta=args.dpo_beta,
         loss_type=args.dpo_loss_type,
-        learning_rate=args.lr,
+        learning_rate=args.dpo_lr,
         batch_size=args.batch_size,
         max_length=512,
         seed=args.seed,
