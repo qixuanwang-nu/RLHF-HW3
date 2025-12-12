@@ -3,6 +3,8 @@
 
 # Output files
 outputs/
+evaluation/
+samples/
 
 # Environment variables
 .env

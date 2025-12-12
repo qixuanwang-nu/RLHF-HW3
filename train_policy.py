@@ -94,6 +94,8 @@ def parse_args():
     # Generation
     parser.add_argument("--max_new_tokens", type=int, default=64,
                         help="Maximum new tokens to generate")
+    parser.add_argument("--min_new_tokens", type=int, default=16,
+                        help="Minimum new tokens to generate (prevents empty/EOS-only outputs)")
     parser.add_argument("--temperature", type=float, default=0.8,
                         help="Sampling temperature")
     
@@ -197,6 +199,7 @@ def train_ppo(
         batch_size=args.batch_size,
         ppo_epochs=args.ppo_epochs,
         max_new_tokens=args.max_new_tokens,
+        min_new_tokens=args.min_new_tokens,
         temperature=args.temperature,
         seed=args.seed,
     )
@@ -276,6 +279,7 @@ def train_grpo(
         learning_rate=args.lr,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
+        min_new_tokens=args.min_new_tokens,
         temperature=args.temperature,
         seed=args.seed,
     )

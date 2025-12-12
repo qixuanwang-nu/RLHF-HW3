@@ -35,13 +35,14 @@ def generate_responses(
     prompts: List[str],
     device: str,
     gen: GenConfig,
-) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """
     Generate responses and return:
     - responses: list[str]
     - output_ids: [B, T]
     - attention_mask: [B, T]
-    - prompt_lengths: [B] number of prompt tokens
+    - prompt_lengths: [B] number of prompt tokens (excluding padding)
+    - prompt_padded_len: int padded prompt length used for batching (response starts here)
     """
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
@@ -57,6 +58,7 @@ def generate_responses(
     input_ids = enc["input_ids"].to(device)
     attention_mask = enc["attention_mask"].to(device)
     prompt_lengths = attention_mask.sum(dim=1)
+    prompt_padded_len = int(input_ids.size(1))
 
     # Ensure model is on the correct device
     model = model.to(device)
@@ -73,11 +75,13 @@ def generate_responses(
 
     full_attention_mask = (out != tokenizer.pad_token_id).long()
     responses: List[str] = []
-    for seq, p_len in zip(out, prompt_lengths.tolist()):
-        resp_tokens = seq[p_len:]
+    # IMPORTANT: with left padding, the response tokens start after the *padded* prompt length,
+    # not after the per-example prompt length (which excludes padding).
+    for seq in out:
+        resp_tokens = seq[prompt_padded_len:]
         responses.append(tokenizer.decode(resp_tokens, skip_special_tokens=True))
 
-    return responses, out, full_attention_mask, prompt_lengths
+    return responses, out, full_attention_mask, prompt_lengths, prompt_padded_len
 
 
 @torch.no_grad()
@@ -117,16 +121,12 @@ def compute_token_log_probs(
     return token_logps
 
 
-def make_response_mask(
-    attention_mask: torch.Tensor,
-    prompt_lengths: torch.Tensor,
-) -> torch.Tensor:
+def make_response_mask(attention_mask: torch.Tensor, response_start: int) -> torch.Tensor:
     """
     Create a float mask [B, T] with 1 for response tokens and 0 otherwise.
     """
     response_mask = torch.zeros_like(attention_mask, dtype=torch.float)
-    for i, p_len in enumerate(prompt_lengths.tolist()):
-        response_mask[i, p_len:] = attention_mask[i, p_len:].float()
+    response_mask[:, response_start:] = attention_mask[:, response_start:].float()
     return response_mask
 
 

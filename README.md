@@ -1,3 +1,165 @@
+## RLHF / GRPO / DPO Assignment
+
+This repository implements a practical RLHF-style alignment assignment using the Anthropic HH-RLHF dataset:
+
+- **Part 1**: Preference data exploration + reward model (pairwise ranking loss)
+- **Part 2**: Policy optimization with **PPO** and **GRPO**
+- **Part 3**: **DPO** (direct preference optimization)
+- **Part 4**: Quantitative + qualitative evaluation (including GPT-4.1‑mini as judge when configured)
+
+---
+
+## Setup
+
+### Option A: Local (recommended for development)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Option B: Docker (required by the assignment)
+
+Build:
+
+```bash
+docker build -t rlhf-assignment .
+```
+
+Run (example):
+
+```bash
+docker run --rm -it rlhf-assignment python train_reward_model.py --help
+```
+
+If you want to use a GPU, run with your platform’s NVIDIA runtime support (e.g., `--gpus all`) and an appropriate CUDA-enabled base image. The included Dockerfile is CPU-focused for portability.
+
+---
+
+## Compute requirements
+
+- **CPU-only**: Works for smoke tests and short runs (`--subset_size`, small `--steps`).
+- **GPU recommended**:
+  - Reward model training on HH-RLHF is substantially faster on GPU.
+  - Policy optimization (PPO/GRPO) benefits strongly from GPU.
+  - Part 4 evaluation with multiple models can be memory-heavy; use:
+    - `--gen_batch_size` and `--score_batch_size` in `evaluate_models.py`
+    - `--amp_dtype fp16` to reduce VRAM
+
+Typical VRAM guidance:
+- **>= 16GB**: workable with small batch sizes
+- **>= 24GB**: comfortable for most runs with batching enabled
+
+---
+
+## Part 1: Dataset exploration + Reward model
+
+Dataset exploration (writes plots/stats to `outputs/exploration/`):
+
+```bash
+python explore_dataset.py
+```
+
+Train reward model (example):
+
+```bash
+python train_reward_model.py --epochs 1 --batch_size 8 --lr 1e-5 --save_model
+```
+
+The trained reward model is saved under `outputs/run_<timestamp>/best_model/`.
+
+---
+
+## Part 2 & 3: Train policy models (PPO / GRPO / DPO)
+
+### PPO
+
+```bash
+python train_policy.py \
+  --method ppo \
+  --reward_model_path <PATH_TO_REWARD_MODEL_DIR> \
+  --steps 500 \
+  --batch_size 8 \
+  --lr 1e-5
+```
+
+### GRPO
+
+```bash
+python train_policy.py \
+  --method grpo \
+  --reward_model_path <PATH_TO_REWARD_MODEL_DIR> \
+  --steps 500 \
+  --batch_size 4 \
+  --group_size 4 \
+  --lr 1e-5
+```
+
+### DPO
+
+```bash
+python train_policy.py \
+  --method dpo \
+  --epochs 1 \
+  --batch_size 8 \
+  --lr 1e-6
+```
+
+Outputs are written under `outputs/policy/run_<timestamp>/` with `*/model/` directories saved.
+
+---
+
+## Part 4: Evaluation (quantitative + qualitative)
+
+**Important folder convention (per assignment):**
+
+- **Reward model evaluation** artifacts live under `outputs/run_<timestamp>/evaluation/`.
+- **RL policy evaluation** artifacts live under `evaluation/run_<timestamp>/`.
+
+The RL evaluation script produces:
+- win-rate vs reference (**GPT-4.1-as-judge** when OpenAI API is configured)
+- reward-model score distributions (reference/PPO/GRPO/DPO)
+- KL drift vs reference (proxy)
+- Pareto frontier (reward vs KL)
+- adversarial qualitative samples
+- training curves + reward–KL tradeoff curves (loaded from `training_stats.json`)
+
+### Configure GPT-4.1 Mini judge
+
+This repo uses an env file. The template is `env.example`:
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="gpt-4.1-mini"
+```
+
+Or edit `env.example` and pass:
+
+```bash
+python evaluate_models.py --env_file env.example --prefer_openai_judge ...
+```
+
+### Run evaluation
+
+```bash
+python evaluate_models.py \
+  --env_file env.example \
+  --prefer_openai_judge \
+  --reward_model_path <PATH_TO_REWARD_MODEL_DIR> \
+  --reference_model openai-community/gpt2 \
+  --ppo_model_path outputs/policy/<run>/ppo/model \
+  --grpo_model_path outputs/policy/<run>/grpo/model \
+  --dpo_model_path outputs/policy/<run>/dpo/model \
+  --num_prompts 200 \
+  --winrate_prompts 120 \
+  --gen_batch_size 4 \
+  --score_batch_size 1 \
+  --amp_dtype fp16
+```
+
+Artifacts are written under `evaluation/run_<timestamp>/`.
+
 # RLHF Implementation: Reward Modeling on Anthropic HH-RLHF
 
 This project implements Part 1 of an RLHF (Reinforcement Learning from Human Feedback) assignment, focusing on preference data collection and reward modeling.

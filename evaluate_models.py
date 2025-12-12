@@ -11,7 +11,7 @@ Qualitative:
 - Adversarial prompt set generation and side-by-side dumps
 
 Outputs:
-  outputs/evaluation/run_<timestamp>/
+  evaluation/run_<timestamp>/
     quantitative.json
     pareto_frontier.json
     winrate.json
@@ -91,7 +91,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefer_openai_judge", action="store_true", help="Use GPT-4-as-judge if OPENAI_API_KEY is set")
 
     # Output
-    p.add_argument("--output_dir", type=str, default="outputs/evaluation", help="Output directory")
+    # Per assignment: RL evaluation artifacts live under ./evaluation/ by default.
+    p.add_argument("--output_dir", type=str, default="evaluation", help="Output directory")
 
     return p.parse_args()
 
@@ -343,18 +344,25 @@ def main() -> None:
     per_model = {}
     pareto_points: List[Dict[str, float]] = []
     reward_arrays: Dict[str, np.ndarray] = {}
+    generations_quant = {"prompts": prompts, "responses": {}, "per_prompt": {}}
 
     for name, model in models.items():
         print(f"Generating for model: {name}")
         # Stream evaluation in batches to avoid GPU OOM.
         all_rewards: List[float] = []
+        all_resps: List[str] = []
         kl_means: List[float] = []
         kl_maxs: List[float] = []
+        per_prompt_kl_mean: List[float] = []
+        per_prompt_reward: List[float] = []
 
         for batch_prompts in _chunks(prompts, args.gen_batch_size):
             # generation
-            _, out_ids, attn, prompt_lens = generate_responses(model, tokenizer, batch_prompts, device, gen_cfg)
-            response_mask = make_response_mask(attn, prompt_lens)
+            batch_resps, out_ids, attn, prompt_lens, prompt_padded_len = generate_responses(
+                model, tokenizer, batch_prompts, device, gen_cfg
+            )
+            all_resps.extend(batch_resps)
+            response_mask = make_response_mask(attn, prompt_padded_len)
 
             # reward scoring (reward model usually smaller than policy, but still batch if needed)
             # If gen_batch_size is large, further split for scoring.
@@ -364,6 +372,7 @@ def main() -> None:
                 m = attn[s : s + args.score_batch_size]
                 r = compute_reward_scores(reward_model, o, m).detach().cpu().numpy().tolist()
                 all_rewards.extend(r)
+                per_prompt_reward.extend(r)
 
             # KL drift scoring (policy forward is expensive; score in small batches)
             kl = {"kl_mean": 0.0, "kl_max": 0.0}
@@ -377,6 +386,7 @@ def main() -> None:
                     )
                     kl_means.append(kl_b["kl_mean"])
                     kl_maxs.append(kl_b["kl_max"])
+                    per_prompt_kl_mean.append(kl_b["kl_mean"])
 
             # Free transient GPU memory
             if torch.cuda.is_available():
@@ -398,6 +408,13 @@ def main() -> None:
         pareto_points.append(
             {"name": name, "reward_mean": per_model[name]["reward"]["mean"], "kl_mean": per_model[name]["kl"]["kl_mean"]}
         )
+
+        # Save per-prompt generations (used for sample export and analysis)
+        generations_quant["responses"][name] = all_resps
+        generations_quant["per_prompt"][name] = {
+            "reward": per_prompt_reward,
+            "kl_mean": ([0.0] * len(per_prompt_reward)) if name == "reference" else per_prompt_kl_mean,
+        }
 
         # Move non-reference models off GPU between evaluations to save memory
         if torch.cuda.is_available() and name != "reference":
@@ -485,6 +502,8 @@ def main() -> None:
 
     with open(os.path.join(run_dir, "quantitative.json"), "w") as f:
         json.dump(quantitative, f, indent=2)
+    with open(os.path.join(run_dir, "generations_quantitative.json"), "w") as f:
+        json.dump(generations_quant, f, indent=2)
     with open(os.path.join(run_dir, "pareto_frontier.json"), "w") as f:
         json.dump({"points": pareto_points, "frontier": frontier}, f, indent=2)
     with open(os.path.join(run_dir, "winrate.json"), "w") as f:

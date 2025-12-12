@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Large/generated artifacts
+outputs/
+evaluation/
+*.zip
+
+

@@ -41,6 +41,7 @@ class GRPOConfig:
     
     # Generation settings
     max_new_tokens: int = 128
+    min_new_tokens: int = 16
     temperature: float = 0.8
     top_p: float = 0.95
     
@@ -79,6 +80,7 @@ class GRPOPolicy(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 128,
+        min_new_tokens: int = 0,
         temperature: float = 0.8,
         top_p: float = 0.95,
         num_return_sequences: int = 1,
@@ -90,6 +92,7 @@ class GRPOPolicy(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             temperature=temperature,
             top_p=top_p,
             do_sample=True,
@@ -501,6 +504,8 @@ class GRPOTrainer:
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
         
+        # With left padding, the response always starts after the padded prompt length.
+        prompt_padded_len = int(input_ids.size(1))
         prompt_lengths = attention_mask.sum(dim=1).tolist()
         
         all_responses = []
@@ -518,6 +523,7 @@ class GRPOTrainer:
                 input_ids=ids_expanded,
                 attention_mask=mask_expanded,
                 max_new_tokens=self.config.max_new_tokens,
+                min_new_tokens=int(getattr(self.config, "min_new_tokens", 0) or 0),
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
                 num_return_sequences=group_size,
@@ -525,10 +531,9 @@ class GRPOTrainer:
             )
             
             # Decode responses
-            prompt_len = prompt_lengths[i]
             responses = []
             for out in output_ids:
-                response_tokens = out[prompt_len:]
+                response_tokens = out[prompt_padded_len:]
                 response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
                 responses.append(response)
             
