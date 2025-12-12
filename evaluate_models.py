@@ -274,6 +274,10 @@ def main() -> None:
     win_prompts = load_hh_prompts(split=args.prompt_split, num_prompts=args.winrate_prompts, seed=args.seed + 999)
     print(f"Loaded {len(win_prompts)} prompts for win-rate eval")
 
+    # Ensure all models are on the correct device before win-rate evaluation
+    for name, model in models.items():
+        model.to(device)
+
     # Generate reference once
     # Generate reference in batches
     ref_resps: List[str] = []
@@ -315,6 +319,10 @@ def main() -> None:
         }
 
     # Qualitative adversarial set
+    # Ensure all models are on the correct device before adversarial evaluation
+    for name, model in models.items():
+        model.to(device)
+    
     adv = adversarial_prompts()
     adv_out = {"prompts": adv, "responses": {}}
     for name, model in models.items():

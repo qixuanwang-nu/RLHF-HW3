@@ -58,6 +58,8 @@ def generate_responses(
     attention_mask = enc["attention_mask"].to(device)
     prompt_lengths = attention_mask.sum(dim=1)
 
+    # Ensure model is on the correct device
+    model = model.to(device)
     model.eval()
     out = model.generate(
         input_ids=input_ids,
