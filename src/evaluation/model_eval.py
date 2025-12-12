@@ -93,10 +93,20 @@ def compute_token_log_probs(
     model,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    autocast_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """
     Returns per-token logp for the *next-token* targets: [B, T-1]
     """
+    if input_ids.is_cuda and autocast_dtype is not None:
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+            logits = outputs.logits[:, :-1, :]
+            labels = input_ids[:, 1:]
+            log_probs = F.log_softmax(logits, dim=-1)
+            token_logps = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            return token_logps
+
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
     logits = outputs.logits[:, :-1, :]
     labels = input_ids[:, 1:]
@@ -125,6 +135,7 @@ def compute_kl_proxy_vs_reference(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     response_mask: torch.Tensor,
+    autocast_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, float]:
     """
     Compute KL drift proxy on sampled tokens:
@@ -132,8 +143,12 @@ def compute_kl_proxy_vs_reference(
 
     We compute on the next-token log-probs; align response_mask accordingly.
     """
-    policy_logps = compute_token_log_probs(policy_model, input_ids, attention_mask)  # [B, T-1]
-    ref_logps = compute_token_log_probs(ref_model, input_ids, attention_mask)  # [B, T-1]
+    policy_logps = compute_token_log_probs(
+        policy_model, input_ids, attention_mask, autocast_dtype=autocast_dtype
+    )  # [B, T-1]
+    ref_logps = compute_token_log_probs(
+        ref_model, input_ids, attention_mask, autocast_dtype=autocast_dtype
+    )  # [B, T-1]
 
     x = policy_logps - ref_logps
     x = torch.clamp(x, -5.0, 5.0)

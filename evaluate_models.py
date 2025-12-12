@@ -76,6 +76,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_new_tokens", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_p", type=float, default=0.95)
+    p.add_argument("--gen_batch_size", type=int, default=8, help="Batch size for generation (reduce if OOM)")
+    p.add_argument("--score_batch_size", type=int, default=2, help="Batch size for reward/KL scoring (reduce if OOM)")
+    p.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="fp16",
+        choices=["fp16", "bf16", "fp32"],
+        help="Autocast dtype for scoring on CUDA (fp16 usually best for memory)",
+    )
 
     # Win-rate judging
     p.add_argument("--winrate_prompts", type=int, default=120, help="Number of prompts for win-rate eval vs reference")
@@ -89,6 +98,18 @@ def parse_args() -> argparse.Namespace:
 
 def _device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _autocast_dtype(args: argparse.Namespace) -> object:
+    if not torch.cuda.is_available() or args.amp_dtype == "fp32":
+        return None
+    if args.amp_dtype == "bf16":
+        return torch.bfloat16
+    return torch.float16
+
+
+def _chunks(xs: List[str], n: int) -> List[List[str]]:
+    return [xs[i : i + n] for i in range(0, len(xs), n)]
 
 
 def _plot_reward_hist(all_rewards: Dict[str, np.ndarray], out_path: str):
@@ -177,6 +198,7 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
     )
+    amp_dtype = _autocast_dtype(args)
 
     # Quantitative eval per model
     per_model = {}
@@ -185,28 +207,63 @@ def main() -> None:
 
     for name, model in models.items():
         print(f"Generating for model: {name}")
-        responses, out_ids, attn, prompt_lens = generate_responses(model, tokenizer, prompts, device, gen_cfg)
-        response_mask = make_response_mask(attn, prompt_lens)
+        # Stream evaluation in batches to avoid GPU OOM.
+        all_rewards: List[float] = []
+        kl_means: List[float] = []
+        kl_maxs: List[float] = []
 
-        rewards_t = compute_reward_scores(reward_model, out_ids, attn).detach().cpu().numpy()
-        reward_arrays[name] = rewards_t
+        for batch_prompts in _chunks(prompts, args.gen_batch_size):
+            # generation
+            _, out_ids, attn, prompt_lens = generate_responses(model, tokenizer, batch_prompts, device, gen_cfg)
+            response_mask = make_response_mask(attn, prompt_lens)
 
-        kl = {"kl_mean": 0.0, "kl_max": 0.0}
-        if name != "reference":
-            kl = compute_kl_proxy_vs_reference(model, ref, out_ids, attn, response_mask)
+            # reward scoring (reward model usually smaller than policy, but still batch if needed)
+            # If gen_batch_size is large, further split for scoring.
+            bsz = out_ids.size(0)
+            for s in range(0, bsz, args.score_batch_size):
+                o = out_ids[s : s + args.score_batch_size]
+                m = attn[s : s + args.score_batch_size]
+                r = compute_reward_scores(reward_model, o, m).detach().cpu().numpy().tolist()
+                all_rewards.extend(r)
 
-        per_model[name] = {
-            "reward": summarize_distribution(rewards_t),
-            "kl": kl,
-        }
+            # KL drift scoring (policy forward is expensive; score in small batches)
+            kl = {"kl_mean": 0.0, "kl_max": 0.0}
+            if name != "reference":
+                for s in range(0, bsz, args.score_batch_size):
+                    o = out_ids[s : s + args.score_batch_size]
+                    m = attn[s : s + args.score_batch_size]
+                    rm = response_mask[s : s + args.score_batch_size]
+                    kl_b = compute_kl_proxy_vs_reference(
+                        model, ref, o, m, rm, autocast_dtype=amp_dtype
+                    )
+                    kl_means.append(kl_b["kl_mean"])
+                    kl_maxs.append(kl_b["kl_max"])
+
+            # Free transient GPU memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        rewards_np = np.array(all_rewards, dtype=np.float64)
+        reward_arrays[name] = rewards_np
+
+        if name == "reference":
+            kl_summary = {"kl_mean": 0.0, "kl_max": 0.0}
+        else:
+            kl_summary = {
+                "kl_mean": float(np.mean(kl_means)) if kl_means else 0.0,
+                "kl_max": float(np.max(kl_maxs)) if kl_maxs else 0.0,
+            }
+
+        per_model[name] = {"reward": summarize_distribution(rewards_np), "kl": kl_summary}
 
         pareto_points.append(
-            {
-                "name": name,
-                "reward_mean": per_model[name]["reward"]["mean"],
-                "kl_mean": per_model[name]["kl"]["kl_mean"],
-            }
+            {"name": name, "reward_mean": per_model[name]["reward"]["mean"], "kl_mean": per_model[name]["kl"]["kl_mean"]}
         )
+
+        # Move non-reference models off GPU between evaluations to save memory
+        if torch.cuda.is_available() and name != "reference":
+            model.to("cpu")
+            torch.cuda.empty_cache()
 
     frontier = pareto_frontier(pareto_points)
 
@@ -218,13 +275,20 @@ def main() -> None:
     print(f"Loaded {len(win_prompts)} prompts for win-rate eval")
 
     # Generate reference once
-    ref_resps, _, _, _ = generate_responses(ref, tokenizer, win_prompts, device, gen_cfg)
+    # Generate reference in batches
+    ref_resps: List[str] = []
+    for bp in _chunks(win_prompts, args.gen_batch_size):
+        rr, _, _, _ = generate_responses(ref, tokenizer, bp, device, gen_cfg)
+        ref_resps.extend(rr)
 
     winrate = {}
     for name, model in models.items():
         if name == "reference":
             continue
-        model_resps, _, _, _ = generate_responses(model, tokenizer, win_prompts, device, gen_cfg)
+        model_resps: List[str] = []
+        for bp in _chunks(win_prompts, args.gen_batch_size):
+            rr, _, _, _ = generate_responses(model, tokenizer, bp, device, gen_cfg)
+            model_resps.extend(rr)
         wins = 0
         losses = 0
         ties = 0
@@ -254,8 +318,11 @@ def main() -> None:
     adv = adversarial_prompts()
     adv_out = {"prompts": adv, "responses": {}}
     for name, model in models.items():
-        resps, _, _, _ = generate_responses(model, tokenizer, adv, device, gen_cfg)
-        adv_out["responses"][name] = resps
+        adv_resps: List[str] = []
+        for bp in _chunks(adv, args.gen_batch_size):
+            rr, _, _, _ = generate_responses(model, tokenizer, bp, device, gen_cfg)
+            adv_resps.extend(rr)
+        adv_out["responses"][name] = adv_resps
 
     # Save outputs
     quantitative = {
