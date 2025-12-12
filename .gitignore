@@ -4,6 +4,9 @@
 # Output files
 outputs/
 
+# Environment variables
+.env
+
 # Python cache
 __pycache__/
 *.pyc
