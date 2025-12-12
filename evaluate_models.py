@@ -438,7 +438,7 @@ def main() -> None:
     # Generate reference in batches
     ref_resps: List[str] = []
     for bp in _chunks(win_prompts, args.gen_batch_size):
-        rr, _, _, _ = generate_responses(ref, tokenizer, bp, device, gen_cfg)
+        rr, _, _, _, _ = generate_responses(ref, tokenizer, bp, device, gen_cfg)
         ref_resps.extend(rr)
 
     winrate = {}
@@ -447,7 +447,7 @@ def main() -> None:
             continue
         model_resps: List[str] = []
         for bp in _chunks(win_prompts, args.gen_batch_size):
-            rr, _, _, _ = generate_responses(model, tokenizer, bp, device, gen_cfg)
+            rr, _, _, _, _ = generate_responses(model, tokenizer, bp, device, gen_cfg)
             model_resps.extend(rr)
         wins = 0
         losses = 0
@@ -484,7 +484,7 @@ def main() -> None:
     for name, model in models.items():
         adv_resps: List[str] = []
         for bp in _chunks(adv, args.gen_batch_size):
-            rr, _, _, _ = generate_responses(model, tokenizer, bp, device, gen_cfg)
+            rr, _, _, _, _ = generate_responses(model, tokenizer, bp, device, gen_cfg)
             adv_resps.extend(rr)
         adv_out["responses"][name] = adv_resps
 
