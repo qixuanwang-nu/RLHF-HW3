@@ -99,6 +99,33 @@ def parse_args() -> argparse.Namespace:
 def _device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
+def _load_env_file_nonempty(path: str) -> None:
+    """
+    Load KEY=VALUE pairs from a file into os.environ, but only apply non-empty values.
+
+    This avoids the common pitfall where an env template contains OPENAI_API_KEY= (empty)
+    and accidentally disables OpenAI judging.
+    """
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                # Strip optional surrounding quotes
+                if len(val) >= 2 and ((val[0] == val[-1]) and val[0] in ("'", '"')):
+                    val = val[1:-1]
+                if not key or val == "":
+                    continue
+                os.environ[key] = val
+    except OSError:
+        return
+
 
 def _autocast_dtype(args: argparse.Namespace) -> object:
     if not torch.cuda.is_available() or args.amp_dtype == "fp32":
@@ -144,22 +171,134 @@ def _plot_reward_vs_kl(points: List[Dict[str, float]], frontier: List[Dict[str, 
     plt.close()
 
 
+def _try_load_training_stats_from_model_path(model_path: str) -> List[Dict]:
+    """
+    Given a saved model directory like outputs/policy/run_xxx/ppo/model,
+    try to load the corresponding training_stats.json from the parent dir.
+    """
+    if not model_path:
+        return []
+    # model_path may be .../<method>/model
+    parent = os.path.dirname(model_path.rstrip("/"))
+    stats_path = os.path.join(parent, "training_stats.json")
+    if not os.path.exists(stats_path):
+        return []
+    try:
+        with open(stats_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _plot_training_curves(
+    ppo_stats: List[Dict],
+    grpo_stats: List[Dict],
+    dpo_stats: List[Dict],
+    out_dir: str,
+) -> None:
+    """
+    Plot training curves (reward/perf, KL, loss) and trade-offs among them.
+    Saves:
+      - training_curves.png
+      - training_reward_vs_kl.png
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Extract series
+    def series(stats: List[Dict], key: str, default: float = 0.0) -> List[float]:
+        return [float(s.get(key, default)) for s in stats]
+
+    ppo_reward = series(ppo_stats, "reward_mean")
+    ppo_kl = series(ppo_stats, "kl_divergence")
+    ppo_loss = series(ppo_stats, "total_loss")
+
+    grpo_reward = series(grpo_stats, "reward_mean")
+    grpo_kl = series(grpo_stats, "kl_divergence")
+    grpo_loss = series(grpo_stats, "total_loss")
+
+    # DPO doesn't have reward_mean / kl_divergence; use preference margin and implicit KL proxy
+    dpo_perf = series(dpo_stats, "reward_margin")  # >0 means chosen preferred more strongly
+    dpo_kl = series(dpo_stats, "implicit_kl")
+    dpo_loss = series(dpo_stats, "loss")
+
+    # 1) Curves figure
+    plt.figure(figsize=(16, 4.8))
+
+    ax1 = plt.subplot(1, 3, 1)
+    if ppo_reward:
+        ax1.plot(ppo_reward, label="PPO (reward_mean)")
+    if grpo_reward:
+        ax1.plot(grpo_reward, label="GRPO (reward_mean)")
+    if dpo_perf:
+        ax1.plot(dpo_perf, label="DPO (reward_margin)")
+    ax1.set_title("Training Performance")
+    ax1.set_xlabel("Step")
+    ax1.set_ylabel("Value")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    ax2 = plt.subplot(1, 3, 2)
+    if ppo_kl:
+        ax2.plot(ppo_kl, label="PPO (KL)")
+    if grpo_kl:
+        ax2.plot(grpo_kl, label="GRPO (KL)")
+    if dpo_kl:
+        ax2.plot(dpo_kl, label="DPO (implicit_kl)")
+    ax2.set_title("Drift vs Reference")
+    ax2.set_xlabel("Step")
+    ax2.set_ylabel("KL / proxy")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    ax3 = plt.subplot(1, 3, 3)
+    if ppo_loss:
+        ax3.plot(ppo_loss, label="PPO (total_loss)")
+    if grpo_loss:
+        ax3.plot(grpo_loss, label="GRPO (total_loss)")
+    if dpo_loss:
+        ax3.plot(dpo_loss, label="DPO (loss)")
+    ax3.set_title("Training Loss")
+    ax3.set_xlabel("Step")
+    ax3.set_ylabel("Loss")
+    ax3.grid(True, alpha=0.3)
+    ax3.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "training_curves.png"), dpi=150)
+    plt.close()
+
+    # 2) Tradeoff scatter: performance vs KL (per-step)
+    plt.figure(figsize=(7.5, 6.0))
+    if ppo_reward and ppo_kl:
+        plt.scatter(ppo_kl, ppo_reward, s=14, alpha=0.7, label="PPO")
+    if grpo_reward and grpo_kl:
+        plt.scatter(grpo_kl, grpo_reward, s=14, alpha=0.7, label="GRPO")
+    if dpo_perf and dpo_kl:
+        plt.scatter(dpo_kl, dpo_perf, s=14, alpha=0.7, label="DPO")
+    plt.xlabel("KL / proxy (lower is better)")
+    plt.ylabel("Performance (higher is better)")
+    plt.title("Training Trade-off: Performance vs KL")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "training_reward_vs_kl.png"), dpi=150)
+    plt.close()
+
+
 def main() -> None:
     args = parse_args()
     device = _device()
     print(f"Using device: {device}")
 
-    # Load env vars from file if python-dotenv is available
-    try:
-        from dotenv import load_dotenv  # type: ignore
+    # Load env vars from file (non-empty values only)
+    if args.env_file:
+        _load_env_file_nonempty(args.env_file)
+    else:
+        _load_env_file_nonempty("env.example")
 
-        if args.env_file and os.path.exists(args.env_file):
-            load_dotenv(args.env_file, override=False)
-        elif os.path.exists("env.example"):
-            # Best-effort fallback (usually has empty API key, so OpenAI judge won't be used)
-            load_dotenv("env.example", override=False)
-    except Exception:
-        pass
+    if args.prefer_openai_judge:
+        print(f"OPENAI_API_KEY detected: {bool(os.getenv('OPENAI_API_KEY'))}")
+        print(f"OPENAI_MODEL: {os.getenv('OPENAI_MODEL')}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.output_dir, f"run_{ts}")
@@ -355,6 +494,13 @@ def main() -> None:
 
     _plot_reward_hist(reward_arrays, os.path.join(run_dir, "reward_hist.png"))
     _plot_reward_vs_kl(pareto_points, frontier, os.path.join(run_dir, "reward_vs_kl.png"))
+
+    # Training curves (from training_stats.json if available alongside model dirs)
+    ppo_stats = _try_load_training_stats_from_model_path(args.ppo_model_path) if args.ppo_model_path else []
+    grpo_stats = _try_load_training_stats_from_model_path(args.grpo_model_path) if args.grpo_model_path else []
+    dpo_stats = _try_load_training_stats_from_model_path(args.dpo_model_path) if args.dpo_model_path else []
+    if ppo_stats or grpo_stats or dpo_stats:
+        _plot_training_curves(ppo_stats, grpo_stats, dpo_stats, run_dir)
 
     print(f"\nSaved evaluation artifacts to: {run_dir}")
 

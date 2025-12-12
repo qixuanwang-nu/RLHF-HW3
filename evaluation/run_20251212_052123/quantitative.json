@@ -1,0 +1,98 @@
+{
+  "config": {
+    "env_file": "env.example",
+    "reference_model": "openai-community/gpt2",
+    "ppo_model_path": "outputs/policy/run_20251212_041156/ppo/model",
+    "grpo_model_path": "outputs/policy/run_20251212_042432/grpo/model",
+    "dpo_model_path": "outputs/policy/run_20251212_013629/dpo/model",
+    "reward_model_path": "/workspace/RLHF-HW3/outputs/run_20251210_063751/best_model",
+    "prompt_split": "test",
+    "num_prompts": 200,
+    "seed": 42,
+    "max_new_tokens": 128,
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "gen_batch_size": 4,
+    "score_batch_size": 1,
+    "amp_dtype": "fp16",
+    "winrate_prompts": 120,
+    "prefer_openai_judge": true,
+    "output_dir": "outputs/evaluation",
+    "device": "cuda",
+    "judge": "reward_model",
+    "models_loaded": [
+      "reference",
+      "ppo",
+      "grpo",
+      "dpo"
+    ],
+    "gen": {
+      "max_new_tokens": 128,
+      "temperature": 0.8,
+      "top_p": 0.95,
+      "max_prompt_length": 384
+    }
+  },
+  "per_model": {
+    "reference": {
+      "reward": {
+        "mean": -1.0528010381758213,
+        "std": 1.2078808618156922,
+        "p05": -2.717674207687378,
+        "p50": -1.2023066282272339,
+        "p95": 0.46824216842651367,
+        "min": -3.1924843788146973,
+        "max": 2.2584147453308105
+      },
+      "kl": {
+        "kl_mean": 0.0,
+        "kl_max": 0.0
+      }
+    },
+    "ppo": {
+      "reward": {
+        "mean": -0.47626182850450277,
+        "std": 1.0517185045471718,
+        "p05": -2.5572409510612486,
+        "p50": 0.037929654121398926,
+        "p95": 0.4709563046693802,
+        "min": -3.3332276344299316,
+        "max": 1.3298401832580566
+      },
+      "kl": {
+        "kl_mean": 2.907576236340512,
+        "kl_max": 4.00673770904541
+      }
+    },
+    "grpo": {
+      "reward": {
+        "mean": -0.960018006414175,
+        "std": 1.1989175459370025,
+        "p05": -2.677987790107727,
+        "p50": -0.9984298944473267,
+        "p95": 0.46829381585121155,
+        "min": -3.2391979694366455,
+        "max": 2.7633659839630127
+      },
+      "kl": {
+        "kl_mean": 2.1704291218096206,
+        "kl_max": 142.4131622314453
+      }
+    },
+    "dpo": {
+      "reward": {
+        "mean": -1.0718244413658977,
+        "std": 1.2293892979650718,
+        "p05": -2.68722140789032,
+        "p50": -1.3352959156036377,
+        "p95": 0.468242210149765,
+        "min": -4.271533489227295,
+        "max": 1.8398985862731934
+      },
+      "kl": {
+        "kl_mean": 12.601898480815052,
+        "kl_max": 142.4131622314453
+      }
+    }
+  }
+}

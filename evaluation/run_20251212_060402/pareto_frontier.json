@@ -1,0 +1,41 @@
+{
+  "points": [
+    {
+      "name": "reference",
+      "reward_mean": -1.12190041186288,
+      "kl_mean": 0.0
+    },
+    {
+      "name": "ppo",
+      "reward_mean": -0.47626182850450277,
+      "kl_mean": 2.907576236340512
+    },
+    {
+      "name": "grpo",
+      "reward_mean": -0.9761061890423298,
+      "kl_mean": 2.213887489895917
+    },
+    {
+      "name": "dpo",
+      "reward_mean": -1.04651600304991,
+      "kl_mean": 12.547025948965166
+    }
+  ],
+  "frontier": [
+    {
+      "name": "reference",
+      "reward_mean": -1.12190041186288,
+      "kl_mean": 0.0
+    },
+    {
+      "name": "grpo",
+      "reward_mean": -0.9761061890423298,
+      "kl_mean": 2.213887489895917
+    },
+    {
+      "name": "ppo",
+      "reward_mean": -0.47626182850450277,
+      "kl_mean": 2.907576236340512
+    }
+  ]
+}
