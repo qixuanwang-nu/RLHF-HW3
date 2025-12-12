@@ -42,6 +42,18 @@ docker run --rm -it rlhf-assignment python train_reward_model.py --help
 
 If you want to use a GPU, run with your platform’s NVIDIA runtime support (e.g., `--gpus all`) and an appropriate CUDA-enabled base image. The included Dockerfile is CPU-focused for portability.
 
+#### Docker: run training/evaluation (recommended grader commands)
+
+Use a bind mount so `outputs/`, `evaluation/`, and `samples/` are saved to the host:
+
+```bash
+docker run --rm -it \
+  -v "$PWD":/app \
+  -w /app \
+  rlhf-assignment \
+  python train_reward_model.py --epochs 1 --batch_size 4 --subset_size 200 --save_model
+```
+
 ---
 
 ## Compute requirements
@@ -91,6 +103,16 @@ python train_policy.py \
   --lr 1e-5
 ```
 
+Docker (example):
+
+```bash
+docker run --rm -it \
+  -v "$PWD":/app \
+  -w /app \
+  rlhf-assignment \
+  python train_policy.py --method ppo --reward_model_path <PATH_TO_REWARD_MODEL_DIR> --steps 100 --batch_size 2 --lr 1e-5
+```
+
 ### GRPO
 
 ```bash
@@ -103,6 +125,16 @@ python train_policy.py \
   --lr 1e-5
 ```
 
+Docker (example):
+
+```bash
+docker run --rm -it \
+  -v "$PWD":/app \
+  -w /app \
+  rlhf-assignment \
+  python train_policy.py --method grpo --reward_model_path <PATH_TO_REWARD_MODEL_DIR> --steps 100 --batch_size 2 --group_size 4 --lr 1e-5
+```
+
 ### DPO
 
 ```bash
@@ -111,6 +143,16 @@ python train_policy.py \
   --epochs 1 \
   --batch_size 8 \
   --lr 1e-6
+```
+
+Docker (example):
+
+```bash
+docker run --rm -it \
+  -v "$PWD":/app \
+  -w /app \
+  rlhf-assignment \
+  python train_policy.py --method dpo --epochs 1 --batch_size 2 --num_prompts 200 --dpo_lr 1e-6
 ```
 
 Outputs are written under `outputs/policy/run_<timestamp>/` with `*/model/` directories saved.
@@ -167,12 +209,44 @@ python evaluate_models.py \
 
 Artifacts are written under `evaluation/run_<timestamp>/`.
 
+Docker (example):
+
+```bash
+docker run --rm -it \
+  -v "$PWD":/app \
+  -w /app \
+  rlhf-assignment \
+  python evaluate_models.py \
+    --env_file env.example \
+    --prefer_openai_judge \
+    --reward_model_path <PATH_TO_REWARD_MODEL_DIR> \
+    --reference_model openai-community/gpt2 \
+    --ppo_model_path outputs/policy/<run>/ppo/model \
+    --grpo_model_path outputs/policy/<run>/grpo/model \
+    --dpo_model_path outputs/policy/<run>/dpo/model \
+    --num_prompts 200 \
+    --winrate_prompts 120 \
+    --gen_batch_size 4 \
+    --score_batch_size 1 \
+    --amp_dtype fp16
+```
+
 ### Export ~20 samples per model (for submission)
 
 Given an evaluation run directory, export ~20 prompt/response pairs per model:
 
 ```bash
 python export_samples.py --eval_run_dir evaluation/run_<timestamp> --out_dir samples --per_model 20
+```
+
+Docker (example):
+
+```bash
+docker run --rm -it \
+  -v "$PWD":/app \
+  -w /app \
+  rlhf-assignment \
+  python export_samples.py --eval_run_dir evaluation/run_<timestamp> --out_dir samples --per_model 20
 ```
 
 # RLHF Implementation: Reward Modeling on Anthropic HH-RLHF
