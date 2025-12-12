@@ -26,8 +26,8 @@ class GRPOConfig:
     # GRPO hyperparameters
     group_size: int = 4  # Number of responses per prompt (4-8 recommended)
     kl_coef: float = 0.1  # KL penalty coefficient
-    entropy_coef: float = 0.01  # Entropy bonus coefficient (works with min_entropy threshold)
-    min_entropy: float = 1.0  # Minimum entropy threshold to prevent collapse
+    entropy_coef: float = 0.05  # Entropy bonus coefficient
+    min_entropy: float = 2.0  # Minimum entropy threshold (GPT-2 text entropy ~3-5)
     
     # Advantage normalization
     normalize_advantages: bool = True
@@ -296,21 +296,18 @@ class GRPOLoss:
         """
         Compute KL divergence penalty from reference policy.
         
-        Uses the "k3" estimator which is always non-negative:
+        Uses a stable, always-nonnegative proxy computed from sampled actions:
         
-            KL ≈ 0.5 * E[(r - 1)^2]  where r = π(a|s) / π_ref(a|s)
+            kl_proxy(x) = exp(x) - 1 - x,  where x = log π(a|s) - log π_ref(a|s)
         
-        This approximates the true KL while being numerically stable
-        and always positive, preventing the policy from drifting
-        arbitrarily from the reference.
+        Since exp(x) >= 1 + x, this proxy is >= 0 and has well-behaved gradients.
+        We clamp x to avoid exp overflow.
         """
         log_ratio = log_probs - ref_log_probs
-        # Clamp to prevent numerical issues with exp
-        log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
-        ratio = torch.exp(log_ratio)
+        log_ratio = torch.clamp(log_ratio, -5.0, 5.0)
         
-        # k3 estimator: 0.5 * (r - 1)^2, always non-negative
-        kl_approx = 0.5 * (ratio - 1) ** 2
+        # Always-nonnegative proxy: exp(x) - 1 - x
+        kl_approx = torch.expm1(log_ratio) - log_ratio
         
         if mask is not None:
             kl_approx = kl_approx * mask
@@ -318,6 +315,8 @@ class GRPOLoss:
         else:
             kl_value = kl_approx.mean()
         
+        # Clamp to prevent rare explosions dominating optimization
+        kl_value = torch.clamp(kl_value, 0.0, 50.0)
         kl_penalty = self.kl_coef * kl_value
         
         return kl_penalty, float(kl_value.item())
@@ -346,21 +345,15 @@ class GRPOLoss:
         else:
             entropy_value = entropy.mean()
         
-        # Two-part entropy regularization:
-        # 1. Standard entropy maximization (always active)
+        # Entropy maximization (always active)
         entropy_bonus = -self.entropy_coef * entropy_value
         
-        # 2. Strong penalty when entropy drops below threshold
-        # Minimum entropy threshold (GPT-2 natural text entropy is ~3-5)
-        entropy_val_float = entropy_value.item()
-        if entropy_val_float < self.min_entropy:
-            entropy_deficit = self.min_entropy - entropy_val_float
-            collapse_penalty = 5.0 * (entropy_deficit ** 2)  # Strong quadratic penalty
-            entropy_loss = entropy_bonus + collapse_penalty
-        else:
-            entropy_loss = entropy_bonus
+        # IMPORTANT: collapse penalty must be differentiable (do NOT use .item())
+        deficit = F.relu(torch.tensor(self.min_entropy, device=entropy_value.device, dtype=entropy_value.dtype) - entropy_value)
+        collapse_penalty = 10.0 * (deficit ** 2)
+        entropy_loss = entropy_bonus + collapse_penalty
         
-        return entropy_loss, entropy_val_float
+        return entropy_loss, float(entropy_value.detach().item())
     
     def compute_total_loss(
         self,

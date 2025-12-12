@@ -31,10 +31,10 @@ class PPOConfig:
     
     # PPO hyperparameters
     clip_ratio: float = 0.2  # ε in clipped surrogate
-    kl_coef: float = 0.1  # β for KL penalty
-    entropy_coef: float = 0.01  # Entropy bonus coefficient (works with min_entropy threshold)
+    kl_coef: float = 0.2  # β for KL penalty (0.1-0.5 typically)
+    entropy_coef: float = 0.05  # Entropy bonus coefficient
     value_coef: float = 0.5  # Value loss coefficient
-    min_entropy: float = 1.0  # Minimum entropy threshold to prevent collapse
+    min_entropy: float = 2.0  # Minimum entropy threshold (GPT-2 text entropy ~3-5)
     
     # Training settings
     learning_rate: float = 1e-5
@@ -265,13 +265,12 @@ class PPOLoss:
         """
         Compute KL divergence penalty from reference policy.
         
-        Uses the "k3" estimator which is always non-negative:
+        Uses a stable, always-nonnegative proxy computed from sampled actions:
         
-            KL ≈ 0.5 * E[(r - 1)^2]  where r = π(a|s) / π_ref(a|s)
+            kl_proxy(x) = exp(x) - 1 - x,  where x = log π(a|s) - log π_ref(a|s)
         
-        This approximates the true KL while being numerically stable
-        and always positive, preventing the policy from drifting
-        arbitrarily from the reference.
+        Since exp(x) >= 1 + x, this proxy is >= 0 and has well-behaved gradients.
+        We also clamp x to avoid exp overflow.
         
         Args:
             log_probs: Current policy log probs
@@ -283,10 +282,10 @@ class PPOLoss:
             kl_value: Raw KL divergence value
         """
         log_ratio = log_probs - ref_log_probs
+        log_ratio = torch.clamp(log_ratio, -5.0, 5.0)
         
-        # Use absolute log ratio as KL approximation (simpler and stable)
-        # This measures how much the log probs differ, always positive
-        kl_approx = log_ratio.abs()
+        # Always-nonnegative proxy: exp(x) - 1 - x
+        kl_approx = torch.expm1(log_ratio) - log_ratio
         
         if mask is not None:
             kl_approx = kl_approx * mask
@@ -294,8 +293,8 @@ class PPOLoss:
         else:
             kl_value = kl_approx.mean()
         
-        # Clamp KL value to prevent explosion
-        kl_value = torch.clamp(kl_value, 0.0, 100.0)
+        # Clamp to prevent rare explosions dominating optimization
+        kl_value = torch.clamp(kl_value, 0.0, 50.0)
         
         kl_penalty = self.kl_coef * kl_value
         
@@ -340,17 +339,13 @@ class PPOLoss:
         
         # Strong penalty when entropy drops below threshold
         # GPT-2 natural text entropy is ~3-5, so threshold of 1.0 is conservative
-        entropy_val_float = entropy_value.item()
-        if entropy_val_float < self.min_entropy:
-            # Use exponential penalty for entropy collapse - much stronger than quadratic
-            entropy_deficit = self.min_entropy - entropy_val_float
-            # Scale: if entropy=0.1 and threshold=1.0, deficit=0.9, penalty=50*(0.9)^1.5=38
-            collapse_penalty = 50.0 * (entropy_deficit ** 1.5)
-            entropy_loss = entropy_bonus + collapse_penalty
-        else:
-            entropy_loss = entropy_bonus
+        # IMPORTANT: collapse penalty must be differentiable (do NOT use .item())
+        deficit = F.relu(torch.tensor(self.min_entropy, device=entropy_value.device, dtype=entropy_value.dtype) - entropy_value)
+        # Quadratic penalty below threshold (strong but stable)
+        collapse_penalty = 10.0 * (deficit ** 2)
+        entropy_loss = entropy_bonus + collapse_penalty
         
-        return entropy_loss, entropy_val_float
+        return entropy_loss, float(entropy_value.detach().item())
     
     def compute_value_loss(
         self,
