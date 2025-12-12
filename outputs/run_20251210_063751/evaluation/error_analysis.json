@@ -1,0 +1,38 @@
+{
+  "overall_accuracy": 0.638,
+  "num_errors": 362,
+  "num_correct": 638,
+  "total_samples": 1000,
+  "error_rate": 0.362,
+  "patterns": {
+    "length_bias": {
+      "error_chosen_longer": 112,
+      "error_rejected_longer": 144,
+      "error_similar_length": 106,
+      "rejected_longer_error_rate": 0.39779005524861877,
+      "avg_chosen_length_in_errors": 316.9226519337017,
+      "avg_rejected_length_in_errors": 338.3646408839779
+    },
+    "reward_magnitude": {
+      "mean_incorrect_margin": -0.6384152983783523,
+      "median_incorrect_margin": -0.4694734513759613,
+      "max_incorrect_margin": -3.429153561592102,
+      "close_calls": 77
+    },
+    "confidence_analysis": {
+      "low_confidence_errors": 192,
+      "high_confidence_errors": 80
+    }
+  },
+  "reward_stats": {
+    "chosen_mean": -0.06321805271506309,
+    "chosen_std": 1.363858613092911,
+    "rejected_mean": -0.6176604149974882,
+    "rejected_std": 1.5608285393720658,
+    "reward_diff_mean": 0.5544423622824252,
+    "reward_diff_std": 1.3089905515310734,
+    "margin_on_correct": 1.2312675553219259,
+    "margin_on_errors": -0.6384152983783523
+  },
+  "num_error_examples_saved": 50
+}

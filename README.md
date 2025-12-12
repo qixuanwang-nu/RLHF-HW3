@@ -9,6 +9,13 @@ This repository implements a practical RLHF-style alignment assignment using the
 
 ---
 
+## Latest results (for graders)
+
+- **RL evaluation artifacts**: `evaluation/run_20251212_081643/`
+- **Exported samples (~20/model)**: `samples/run_20251212_081643/`
+
+---
+
 ## Setup
 
 ### Option A: Local (recommended for development)
@@ -159,6 +166,14 @@ python evaluate_models.py \
 ```
 
 Artifacts are written under `evaluation/run_<timestamp>/`.
+
+### Export ~20 samples per model (for submission)
+
+Given an evaluation run directory, export ~20 prompt/response pairs per model:
+
+```bash
+python export_samples.py --eval_run_dir evaluation/run_<timestamp> --out_dir samples --per_model 20
+```
 
 # RLHF Implementation: Reward Modeling on Anthropic HH-RLHF
 

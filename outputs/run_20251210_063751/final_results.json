@@ -1,0 +1,37 @@
+{
+  "config": {
+    "max_length": 512,
+    "truncation": "left",
+    "model_name": "openai-community/gpt2",
+    "epochs": 3,
+    "batch_size": 16,
+    "lr": 1e-05,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "max_grad_norm": 1.0,
+    "gradient_accumulation_steps": 1,
+    "eval_steps": 500,
+    "error_analysis_samples": 1000,
+    "output_dir": "outputs",
+    "save_model": true,
+    "seed": 42,
+    "num_workers": 4,
+    "subset_size": null
+  },
+  "training_time_minutes": 277.0385321617126,
+  "best_val_accuracy": 0.6475860420650096,
+  "final_metrics": {
+    "loss": 0.6242793744882251,
+    "accuracy": 0.6462715105162524,
+    "chosen_reward_mean": 0.014624276456652818,
+    "rejected_reward_mean": -0.4931153128454266,
+    "chosen_reward_std": 1.3853874206542969,
+    "rejected_reward_std": 1.5526700019836426,
+    "reward_margin": 0.5084890723228455
+  },
+  "error_analysis_summary": {
+    "accuracy": 0.638,
+    "num_errors": 362,
+    "total_samples": 1000
+  }
+}

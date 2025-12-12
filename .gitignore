@@ -1,9 +1,6 @@
 # Virtual environment
 .venv/
 
-# Output files
-outputs/
-
 # Environment variables
 .env
 
